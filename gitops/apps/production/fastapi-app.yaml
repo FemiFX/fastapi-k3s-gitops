@@ -1,0 +1,53 @@
+# The application, on production.
+#
+# The same chart and the same values file the pipeline used to install with
+# helm. What changed is who applies it and how often: helm ran once per deploy,
+# Argo CD checks every few minutes and corrects drift.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fastapi-app
+  namespace: argocd
+  finalizers:
+    # Deleting this Application deletes what it created, rather than leaving
+    # the workloads orphaned with nothing managing them.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik.git
+    # Production follows its own branch, so promotion is still a merge from
+    # main. Argo CD reads the branch, not the working tree.
+    targetRevision: production
+    path: helm/fastapi-app
+    helm:
+      # Must match the release the pipeline created, or Argo CD renders
+      # different object names and deploys a SECOND copy of the stack
+      # alongside the first -- database included. That happened on staging.
+      releaseName: prod
+      valueFiles:
+        - values-production.yaml
+      parameters:
+        - name: image.repository
+          value: registry.gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik
+        # The tag currently running. Written by release:production after a
+        # human authorises it, so a deploy is a commit and a rollback is a
+        # revert. Never a placeholder: anything in a reconciled path is live
+        # configuration, not documentation.
+        - name: image.tag
+          value: "22e0d502"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

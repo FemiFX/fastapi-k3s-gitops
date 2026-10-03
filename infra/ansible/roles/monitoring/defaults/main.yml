@@ -1,0 +1,54 @@
+---
+# kube-prometheus-stack: Prometheus, Alertmanager, Grafana, node-exporter and
+# kube-state-metrics in one chart, plus the Prometheus Operator that turns
+# ServiceMonitor and PrometheusRule objects into scrape config and alert rules.
+#
+# Pinned to what was actually installed and proven on this cluster. It was
+# left empty for the first install, because the current version cannot be
+# known ahead of time; the role prints what it resolved, and this is that.
+kube_prometheus_stack_version: "89.2.2"
+
+monitoring_namespace: monitoring
+monitoring_release: monitoring
+
+# Sized for a 6 GB node that is also running the application and its database.
+# Defaults from the chart assume a great deal more room than that.
+prometheus_retention: "7d"
+prometheus_storage: "8Gi"
+alertmanager_storage: "2Gi"
+grafana_storage: "2Gi"
+
+# How long without a successful backup before it counts as a problem. The job
+# runs nightly, so 26 hours allows one missed run plus slack.
+backup_max_age_hours: 26
+
+
+# Supplied at run time, never committed:
+#   ansible-playbook site.yml --tags monitoring --limit prod-server \
+#     -e grafana_admin_password=...
+grafana_admin_password: ""
+
+# Where alerts are delivered. Mattermost accepts Slack-format payloads on an
+# incoming webhook, so Alertmanager's slack_configs talks to it directly with
+# no adapter in between. Passed at run time:
+#   -e mattermost_webhook_url=https://mattermost.example.com/hooks/xxxx
+mattermost_webhook_url: ""
+# Optional. Mattermost webhooks have a default channel; set this only to
+# override it.
+mattermost_channel: ""
+
+# The dead man's switch. kube-prometheus-stack ships a Watchdog alert that
+# fires constantly and on purpose; it is routed to a service that alerts when
+# it STOPS arriving, such as a free healthchecks.io check.
+#
+# This is the most valuable receiver of the lot. If Prometheus dies, or
+# Alertmanager dies, or the node goes dark, every other alert falls silent --
+# and silence is indistinguishable from health. Leave this empty and nothing
+# is watching the monitoring itself.
+healthchecks_ping_url: ""
+
+# How long Alertmanager collects related alerts before sending, and how long
+# before it repeats one that is still firing.
+alert_group_wait: 30s
+alert_group_interval: 5m
+alert_repeat_interval: 12h

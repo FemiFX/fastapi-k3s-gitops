@@ -1,0 +1,18 @@
+# Managed by Ansible. Manual edits will be overwritten.
+[Unit]
+Description=Port forwarding from the public address to the production VM
+# After pve-firewall, because it flushes and rebuilds the filter table when it
+# starts. Rules added before it would be discarded.
+After=network-online.target pve-firewall.service
+Wants=network-online.target
+# PartOf, so a pve-firewall restart re-runs this. Otherwise restarting the
+# firewall silently removes the forwarding until the next reboot.
+PartOf=pve-firewall.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pve-portforward
+
+[Install]
+WantedBy=multi-user.target

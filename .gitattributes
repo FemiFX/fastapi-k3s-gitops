@@ -1,0 +1,18 @@
+# Line-ending policy.
+#
+# Normalize every text file to LF both in the repository AND in the working
+# tree. This project builds Linux containers and deploys to Linux (Proxmox/k3s),
+# so LF everywhere prevents cross-platform breakage. The classic failure this
+# avoids: a CRLF line ending in a shell script appends a stray \r, which breaks
+# the shebang/commands once the script runs inside a Linux container.
+* text=auto eol=lf
+
+# Explicit safety net for files where CRLF would be fatal at runtime.
+# (Already covered by the wildcard above, but stated for clarity.)
+*.sh        text eol=lf
+Dockerfile* text eol=lf
+
+# Binary files: never alter their bytes.
+*.png binary
+*.ico binary
+*.jpg binary

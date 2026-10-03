@@ -1,0 +1,66 @@
+# Values for the argo-cd chart. Rendered by the argocd role.
+
+global:
+  # Every component gets explicit requests and limits. The node is shared with
+  # the application, its database and the monitoring stack.
+  revisionHistoryLimit: 3
+
+configs:
+  params:
+    # No TLS inside the cluster. Argo CD is reached with kubectl port-forward
+    # over the SSH jump host, so the connection is already encrypted by SSH and
+    # terminating TLS twice buys nothing. If it is ever exposed through the
+    # ingress, this must change.
+    server.insecure: true
+    # How long between reconciliation passes.
+    timeout.reconciliation: {{ argocd_reconcile_timeout }}
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: {{ argocd_controller_memory_limit }}
+
+repoServer:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: {{ argocd_repo_server_memory_limit }}
+
+server:
+  # ClusterIP, deliberately. An admin console on a public address is a standing
+  # liability, and port-forward over SSH costs one command.
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: {{ argocd_server_memory_limit }}
+
+applicationSet:
+  # Not used yet. It generates Applications from a template, which matters with
+  # many environments; we have two and declare them explicitly.
+  enabled: false
+
+notifications:
+  # Alerting already goes through Alertmanager. A second notification system
+  # would be a second place to look.
+  enabled: false
+
+dex:
+  # Single sign-on. Not needed for one operator with a port-forward.
+  enabled: false
+
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi

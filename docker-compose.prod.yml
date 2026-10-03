@@ -1,0 +1,69 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    expose:
+      # The application runs as a non-root user, which cannot bind a port below
+      # 1024. Traefik routes to whatever is exposed, so nothing else changes.
+      - 8000
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:?Set POSTGRES_USER in the production environment}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the production environment}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in the production environment}
+    depends_on:
+      - db
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fastapi.rule=Host(`${APP_DOMAIN:?Set APP_DOMAIN in the production environment}`)"
+      - "traefik.http.routers.fastapi.tls=true"
+      - "traefik.http.routers.fastapi.tls.certresolver=letsencrypt"
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data/
+    expose:
+      - 5432
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:?Set POSTGRES_USER in the production environment}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the production environment}
+      - POSTGRES_DB=${POSTGRES_DB:?Set POSTGRES_DB in the production environment}
+  traefik:
+    image: traefik:v3.7.5
+    # Traefik ignores CLI flags entirely when a static configuration file is
+    # present, so all static configuration lives here as flags. A single source
+    # avoids silently dead settings and lets environment-specific values such as
+    # the ACME account email come from the environment instead of the image.
+    # ACME_CA_SERVER defaults to the Let's Encrypt production CA; point it at
+    # https://acme-staging-v02.api.letsencrypt.org/directory while testing to
+    # avoid consuming the strict production rate limits.
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --accesslog=true
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?Set ACME_EMAIL in the production environment}
+      - --certificatesresolvers.letsencrypt.acme.storage=/certificates/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./traefik-public-certificates:/certificates"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DASHBOARD_DOMAIN:?Set TRAEFIK_DASHBOARD_DOMAIN in the production environment}`) && PathPrefix(`/`)"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH:?Set TRAEFIK_DASHBOARD_AUTH in the production environment}"
+
+volumes:
+  postgres_data_prod:
+  traefik-public-certificates:

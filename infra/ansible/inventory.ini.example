@@ -1,0 +1,40 @@
+# The VMs created by Terraform. Addresses match infra/terraform/variables.tf.
+#
+# The VMs sit on a private network behind the Proxmox host, so every connection
+# hops through that host first (see ansible_ssh_common_args below).
+
+# The hypervisor itself. Reached directly, not through a jump host, because it
+# is the jump host.
+[proxmox]
+proxmox-host ansible_host=203.0.113.10
+
+[proxmox:vars]
+ansible_user=<proxmox-ssh-user>
+
+[ci_runner]
+ci-runner ansible_host=10.10.10.10
+
+[k3s_staging]
+staging ansible_host=10.10.10.20 app_namespace=staging
+
+[prod_server]
+prod-server ansible_host=10.10.10.30 app_namespace=production public_hostname=project.femidevops.abrdns.com ingress_internal_ip=10.10.10.30 traefik_replicas=2
+
+[prod_agent]
+prod-agent ansible_host=10.10.10.31
+
+# Every machine that runs a k3s control plane.
+[k3s_servers:children]
+k3s_staging
+prod_server
+
+# Every machine that runs k3s at all.
+[k3s:children]
+k3s_servers
+prod_agent
+
+[all:vars]
+ansible_user=femi
+ansible_python_interpreter=/usr/bin/python3
+# The jump host, connection sharing and host key policy all live in
+# ssh_config, which ansible.cfg points at.

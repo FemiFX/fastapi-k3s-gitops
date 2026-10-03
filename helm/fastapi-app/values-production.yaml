@@ -1,0 +1,23 @@
+# Production: two replicas so a rolling update never drops to zero available
+# Pods, and so the second node actually gets work.
+replicaCount: 2
+
+ingress:
+  enabled: true
+  className: traefik
+  host: project.femidevops.abrdns.com
+  tls:
+    enabled: true
+    # letsencrypt-prod issues browser-trusted certificates. Switch to
+    # letsencrypt-staging while experimenting: it is untrusted but has far
+    # looser rate limits, and the production CA counts failures against you.
+    issuer: letsencrypt-prod
+
+postgres:
+  storage: 10Gi
+
+backup:
+  # Production holds the only data that cannot be rebuilt from code, so its
+  # dumps go somewhere that is not this node.
+  offsite:
+    enabled: true

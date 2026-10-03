@@ -1,0 +1,135 @@
+---
+# What Prometheus should scrape, and what should wake somebody up.
+#
+# ServiceMonitor and PrometheusRule are custom resources the Prometheus
+# Operator watches. You describe intent; the operator writes the scrape config
+# and the rule files and reloads Prometheus. You never edit prometheus.yml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fastapi-app
+  namespace: {{ monitoring_namespace }}
+spec:
+  # The application lives in another namespace, so say so explicitly.
+  namespaceSelector:
+    matchNames: [{{ app_namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fastapi-app
+  endpoints:
+    # By port name, not number. The database Service carries the same labels
+    # but has no port called http, so it produces no target rather than a
+    # permanently failing one.
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fastapi-app
+  namespace: {{ monitoring_namespace }}
+spec:
+  groups:
+    - name: fastapi-app.backups
+      rules:
+        - alert: BackupJobFailed
+          # Restricted to recent Jobs on purpose. A failed Job stays in history
+          # until failedJobsHistoryLimit evicts it, which takes three more
+          # failures and may never happen -- so "does a failed Job exist" fires
+          # forever after a single bad night, long after backups have recovered.
+          #
+          # An alert that can only be silenced by deleting an object teaches
+          # people to delete objects to silence alerts, which is the worst
+          # habit to build around a backup system.
+          #
+          # Old failures are not lost: BackupStale covers "nothing has
+          # succeeded recently", which is the question that actually matters.
+          expr: >-
+            kube_job_status_failed{namespace="{{ app_namespace }}",
+            job_name=~".+-fastapi-app-backup-.+"} > 0
+            and on(job_name)
+            (time() - kube_job_created{namespace="{{ app_namespace }}",
+            job_name=~".+-fastapi-app-backup-.+"}) < {{ backup_max_age_hours * 3600 }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Database backup job failed"
+            description: >-
+              {% raw %}{{ $labels.job_name }}{% endraw %} reported a failed pod.
+              The nightly dump did not complete.
+
+        - alert: BackupStale
+          # Retention deletes dumps by age. A run of failures would eventually
+          # delete every dump and leave nothing, so the age of the newest
+          # successful backup matters more than any single job's result.
+          expr: >-
+            (time() - max(kube_job_status_completion_time{namespace="{{ app_namespace }}",
+            job_name=~".+-fastapi-app-backup-.+"})) > {{ backup_max_age_hours * 3600 }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No successful database backup in {{ backup_max_age_hours }} hours"
+            description: >-
+              The most recent completed backup job is older than
+              {{ backup_max_age_hours }} hours.
+
+        - alert: BackupMetricMissing
+          # An alert on a metric that has stopped being reported never fires:
+          # the expression returns no data, and no data is not a breach of a
+          # threshold. absent() is how you alert on silence rather than on a
+          # bad value. Without this, deleting the CronJob would look identical
+          # to everything being fine.
+          expr: >-
+            absent(kube_job_status_completion_time{namespace="{{ app_namespace }}",
+            job_name=~".+-fastapi-app-backup-.+"})
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "No backup jobs are being reported at all"
+            description: >-
+              kube-state-metrics reports no completed backup jobs in
+              {{ app_namespace }}. The CronJob may have been removed, or no run
+              has ever succeeded.
+
+    - name: fastapi-app.availability
+      rules:
+        - alert: ApplicationNoReadyReplicas
+          expr: >-
+            kube_deployment_status_replicas_available{namespace="{{ app_namespace }}",
+            deployment=~".+-fastapi-app"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No ready replicas serving the application"
+            description: >-
+              Every pod is failing its readiness probe, so nothing is behind the
+              Service. Check /ready and the pod logs.
+
+        - alert: ApplicationTargetDown
+          # Distinct from the alert above: this fires when Prometheus cannot
+          # scrape at all.
+          #
+          # By namespace, not by job. The job label comes from the Service name,
+          # which this file does not control, and an earlier version named a
+          # series that never existed -- so the alert could never have fired.
+          expr: up{namespace="{{ app_namespace }}"} == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus cannot scrape the application"
+
+        - alert: DatabaseDown
+          expr: >-
+            kube_statefulset_status_replicas_ready{namespace="{{ app_namespace }}",
+            statefulset=~".+-fastapi-app-db"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgreSQL has no ready replica"

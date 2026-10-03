@@ -1,0 +1,170 @@
+# Least-privilege permissions for the GitLab Agent's ServiceAccount.
+#
+# The agent's Helm chart would normally bind the account to cluster-admin. That
+# is disabled (rbac.create=false) and replaced by this, so a pipeline can only
+# touch the one namespace it deploys to. A mistake or a compromised pipeline
+# cannot reach the rest of the cluster.
+
+# Everything the deploy job needs inside its own namespace: Helm's release
+# secrets, the workloads, storage claims and the ingress.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: {{ app_namespace }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - secrets
+      - configmaps
+      - persistentvolumeclaims
+      - serviceaccounts
+      - events
+      - endpoints
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets, replicasets, daemonsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [ingresses]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["traefik.io"]
+    # The chart installs a Traefik Middleware to redirect HTTP to HTTPS.
+    # Traefik CRDs are a separate API group from core Kubernetes objects, so
+    # permission to manage Ingresses does not extend to them.
+    resources: [middlewares]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["batch"]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: ["policy"]
+    # PodDisruptionBudget lives in its own API group, so nothing above grants
+    # it. Missing this fails the deploy with "forbidden", the same way the
+    # Traefik Middleware did. Every new kind of object needs its own grant.
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployer
+  namespace: {{ app_namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployer
+subjects:
+  - kind: ServiceAccount
+    name: {{ gitlab_agent_service_account }}
+    namespace: {{ gitlab_agent_namespace }}
+---
+# Cluster-wide, but read-only and minimal. kubectl and Helm need to look up
+# namespaces and API resources before they can do anything useful.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: deployer-discovery
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, nodes]
+    verbs: [get, list]
+  - apiGroups: ["storage.k8s.io"]
+    resources: [storageclasses]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: deployer-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: deployer-discovery
+subjects:
+  - kind: ServiceAccount
+    name: {{ gitlab_agent_service_account }}
+    namespace: {{ gitlab_agent_namespace }}
+---
+# The agent also needs permissions to run itself, separate from what it may do
+# to our applications. It runs two replicas and elects a leader between them
+# using a Lease, so without this it logs "leases ... is forbidden" forever.
+# These rights are confined to the agent's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-self
+  namespace: {{ gitlab_agent_namespace }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [configmaps, secrets, pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-self
+  namespace: {{ gitlab_agent_namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-self
+subjects:
+  - kind: ServiceAccount
+    name: {{ gitlab_agent_service_account }}
+    namespace: {{ gitlab_agent_namespace }}
+---
+# The pipeline also has to put a small, named set of Secrets into the
+# monitoring namespace: the Mattermost webhook URL that Alertmanager reads, and
+# Grafana's admin password. The chart values that reference them are reconciled
+# from git by Argo CD, and credentials cannot go in git, so the config and the
+# credential are split -- and the credentials have to arrive by some other
+# route.
+#
+# Scoped as narrowly as RBAC allows, because the monitoring namespace holds
+# things the deploy pipeline has no business reading, Grafana's admin password
+# among them.
+#
+# Note the two separate rules. `create` cannot be restricted with
+# resourceNames: at the moment the request is authorised the object does not
+# exist yet, so there is no name to match on. Everything after creation can be
+# restricted, and is. The practical effect is that a compromised pipeline could
+# add new Secrets to this namespace but could not read or alter any Secret it
+# did not create.
+#
+# No list, no watch, no delete, and no other resource at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alert-webhook-writer
+  namespace: {{ monitoring_namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: {{ monitoring_ci_secrets | to_json }}
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alert-webhook-writer
+  namespace: {{ monitoring_namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: alert-webhook-writer
+subjects:
+  - kind: ServiceAccount
+    name: {{ gitlab_agent_service_account }}
+    namespace: {{ gitlab_agent_namespace }}

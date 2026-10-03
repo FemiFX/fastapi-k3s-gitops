@@ -1,0 +1,32 @@
+# Vulnerabilities we have assessed and consciously accepted, with the date the
+# acceptance runs out.
+#
+# Currently empty: the findings from the first real scan were fixed rather than
+# suppressed. That is the preferred outcome and should stay the default.
+#
+# This is the YAML form rather than the plain .trivyignore list, because
+# expired_at is enforced: once the date passes, trivy stops ignoring the
+# finding and the pipeline goes red again. A review date in a comment is a
+# promise; this is a deadline.
+#
+# Rules for adding an entry:
+#   1. Say why it does not apply to US, specifically, with reference to our own
+#      code. "Low risk" is not a reason. "We have no endpoint that accepts a
+#      request body" is.
+#   2. Never suppress something you have not read. If you cannot describe the
+#      vulnerability, you cannot justify ignoring it.
+#   3. Prefer fixing it. Every entry here is a decision to ship a known flaw.
+#
+# The scan already passes --ignore-unfixed, so anything with no patch available
+# never reaches this file. Everything here would be something we COULD fix.
+#
+# Shape of an entry:
+#
+#   vulnerabilities:
+#     - id: CVE-0000-00000
+#       statement: |
+#         What it is, and why it cannot be reached through our code.
+#         Fixed in <package> <version>.
+#       expired_at: 2026-12-01
+
+vulnerabilities: []

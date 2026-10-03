@@ -1,0 +1,27 @@
+# k3s installs Traefik from a HelmChart object it manages itself. Editing the
+# Traefik Deployment by hand would be undone on the next k3s restart. A
+# HelmChartConfig is the supported way to change its values: k3s merges this
+# into the chart's values and reconciles.
+#
+# Dropped into /var/lib/rancher/k3s/server/manifests, which k3s watches and
+# applies -- the same mechanism it uses to install Traefik in the first place.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      replicas: {{ traefik_replicas }}
+    # Prefer, not require. On a single-node cluster a hard rule would leave the
+    # second replica permanently unschedulable.
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: traefik

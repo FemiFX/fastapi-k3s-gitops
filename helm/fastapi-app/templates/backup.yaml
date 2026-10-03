@@ -1,0 +1,203 @@
+{{- if .Values.backup.enabled -}}
+{{- $fullName := include "fastapi-app.fullname" . -}}
+# Somewhere to keep the dumps. A separate volume from the database itself, so
+# losing the database volume does not take the backups with it. On a single
+# node that is still the same disk, which is a real limitation worth stating:
+# it protects against a dropped table, not against the node dying.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullName }}-backups
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+  annotations:
+    # Backups have to outlive the release. Without this, helm uninstall
+    # deletes the claim, and the dumps go with it at exactly the moment
+    # someone would want them.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.backup.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.storage }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullName }}-backup
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Do not retry forever on a broken database; fail and let the alert stand.
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "fastapi-app.selectorLabels" . | nindent 12 }}
+            component: backup
+        spec:
+          # Never, not OnFailure. With OnFailure the Job restarts the
+          # container inside the same Pod and then DELETES that Pod once the
+          # backoff limit is reached -- so a failed backup destroys the only
+          # record of why it failed. That happened: the first off-site run left
+          # nothing but "BackoffLimitExceeded".
+          #
+          # With Never each attempt is a new Pod and the failed ones are kept,
+          # so the logs survive to be read.
+          restartPolicy: Never
+          # The dump is an initContainer and the upload is the container, which
+          # is how a Pod expresses "this, then that". Containers in a Pod start
+          # together; initContainers run to completion first. So the job
+          # succeeds only if the dump worked AND it reached the off-site
+          # repository -- which is the honest definition of a backup being done.
+          initContainers:
+            - name: pg-dump
+              # Same image as the database, so pg_dump always matches the
+              # server version. A newer server than client refuses to dump.
+              image: {{ .Values.postgres.image }}
+              env:
+                - name: PGHOST
+                  value: {{ $fullName }}-db
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.existingSecret }}, key: POSTGRES_USER}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.existingSecret }}, key: POSTGRES_PASSWORD}
+                - name: PGDATABASE
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.existingSecret }}, key: POSTGRES_DB}
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="/backups/${PGDATABASE}-${STAMP}.sql.gz"
+
+                  echo "Dumping ${PGDATABASE} from ${PGHOST}"
+                  # --clean --if-exists makes the dump able to restore over an
+                  # existing database instead of only into an empty one.
+                  pg_dump --clean --if-exists --no-owner | gzip > "${OUT}.partial"
+
+                  # Only rename once the dump finished. A crash halfway leaves a
+                  # .partial file rather than a truncated backup that looks fine.
+                  mv "${OUT}.partial" "${OUT}"
+                  echo "Wrote ${OUT} ($(du -h "${OUT}" | cut -f1))"
+
+                  # A dump that restores nothing is worse than no dump, because
+                  # it is believed. Check it is a real archive and mentions the
+                  # table we expect.
+                  if ! gzip -t "${OUT}"; then
+                    echo "Backup is not a valid gzip archive" >&2
+                    exit 1
+                  fi
+                  if ! gzip -dc "${OUT}" | grep -q "CREATE TABLE"; then
+                    echo "Backup contains no table definitions" >&2
+                    exit 1
+                  fi
+                  echo "Verified ${OUT}"
+
+                  echo "Removing dumps older than ${RETENTION_DAYS} days"
+                  find /backups -name '*.sql.gz' -mtime "+${RETENTION_DAYS}" -print -delete
+                  find /backups -name '*.partial' -mtime +1 -print -delete
+
+                  echo "Backups now held:"
+                  ls -lh /backups
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi}
+          containers:
+{{- if .Values.backup.offsite.enabled }}
+            - name: offsite
+              # restic rather than a plain copy, for four reasons: it encrypts
+              # before anything leaves the cluster, it deduplicates so fourteen
+              # similar dumps cost about one, it enforces its own retention, and
+              # `restic check` verifies the REMOTE repository is intact -- the
+              # off-site equivalent of the gzip test above.
+              image: {{ .Values.backup.offsite.image }}
+              env:
+                # Repository, password and keys all come from a Secret the
+                # pipeline builds from CI/CD variables. The repository URL holds
+                # the account id, so it is kept out of git along with the rest.
+                - name: RESTIC_REPOSITORY
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.backup.offsite.existingSecret }}, key: RESTIC_REPOSITORY}
+                - name: RESTIC_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.backup.offsite.existingSecret }}, key: RESTIC_PASSWORD}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.backup.offsite.existingSecret }}, key: AWS_ACCESS_KEY_ID}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef: {name: {{ .Values.backup.offsite.existingSecret }}, key: AWS_SECRET_ACCESS_KEY}
+                - name: RESTIC_HOST
+                  value: {{ .Release.Name }}
+                # R2 ignores the region but the S3 client insists on one being
+                # set. "auto" is what Cloudflare documents.
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  # init is safe to attempt every run: it fails harmlessly once
+                  # the repository exists.
+                  restic snapshots >/dev/null 2>&1 || restic init
+
+                  echo "Shipping /backups to the off-site repository"
+                  restic backup --host "${RESTIC_HOST}" --tag pgdump /backups
+
+                  # Verify what is now in the remote repository, not what we
+                  # believe we sent. Reads a sample of the actual data.
+                  restic check --read-data-subset={{ .Values.backup.offsite.checkSubset }}
+
+                  echo "Off-site snapshots now held:"
+                  restic snapshots --host "${RESTIC_HOST}" --tag pgdump --compact
+
+                  # NOTE: no `restic forget --prune` here, deliberately. Pruning
+                  # needs delete permission on the bucket, and a backup job that
+                  # can delete backups is the first thing an attacker uses. The
+                  # credentials are write-and-read only, and expiry is a manual
+                  # operation run from a trusted machine. See helm/README.md.
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {cpu: 500m, memory: 512Mi}
+{{- else }}
+            - name: report
+              # Nothing to ship off-site. The dump above has already run as an
+              # initContainer, so this only states what is held.
+              image: {{ .Values.postgres.image }}
+              command: ["/bin/sh", "-c", "echo 'Off-site copies are disabled.'; ls -lh /backups"]
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 100m, memory: 64Mi}
+{{- end }}
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ $fullName }}-backups
+{{- end }}

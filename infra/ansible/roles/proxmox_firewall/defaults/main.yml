@@ -1,0 +1,26 @@
+---
+# Ports reachable from the internet. Everything else is dropped, which also
+# closes rpcbind (111), spiceproxy (3128) and LLMNR (5355) that are currently
+# exposed for no reason.
+firewall_allowed_tcp_ports:
+  - { port: 22,   comment: "SSH" }
+  - { port: 8006, comment: "Proxmox web interface" }
+  - { port: 80,   comment: "HTTP, forwarded to production" }
+  - { port: 443,  comment: "HTTPS, forwarded to production" }
+
+# Where inbound 80/443 are sent. Must match prod-server in the Terraform config.
+firewall_production_ip: "10.10.10.30"
+
+# The bridge facing the internet.
+firewall_uplink: vmbr0
+
+# The bridge the VMs sit on, and their subnet. Needed for hairpin NAT: a VM
+# asking for the public address has to be sent back inside rather than out.
+firewall_internal_bridge: vmbr1
+firewall_internal_subnet: "10.10.10.0/24"
+
+# The host's public address, as seen from the internet.
+firewall_public_ip: "203.0.113.10"
+
+# Set true only after reading the compiled ruleset. See the role's comments.
+firewall_enable: false

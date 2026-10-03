@@ -1,0 +1,99 @@
+{{- if .Values.postgres.enabled -}}
+# PostgreSQL runs as a StatefulSet, not a Deployment. A Deployment treats Pods
+# as interchangeable and names them randomly. A StatefulSet gives a stable name
+# and its own PersistentVolume that survives restarts. A database needs both.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}-db
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "fastapi-app.fullname" . }}-db
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "fastapi-app.selectorLabels" . | nindent 6 }}
+      component: db
+  template:
+    metadata:
+      labels:
+        {{- include "fastapi-app.selectorLabels" . | nindent 8 }}
+        component: db
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: POSTGRES_DB
+            # Postgres writes into a subdirectory because some volume types put
+            # a lost+found entry at the mount point itself.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Through a shell, because $(VAR) substitution applies to a
+          # container's command and args and NOT to a probe's exec command. Left
+          # as ["pg_isready", "-U", "$(POSTGRES_USER)"] the placeholder is passed
+          # through literally, pg_isready falls back to the OS user, and
+          # PostgreSQL logs FATAL: role "root" does not exist every few seconds
+          # forever. The probe still passes -- a rejected role is still the
+          # server answering -- so the only symptom is a log full of errors that
+          # teaches everyone to ignore the log.
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER"']
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER"']
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.postgres.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}-db
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+spec:
+  # Headless service: gives the Pod a stable DNS name.
+  clusterIP: None
+  selector:
+    {{- include "fastapi-app.selectorLabels" . | nindent 4 }}
+    component: db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end }}

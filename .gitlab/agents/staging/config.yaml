@@ -1,0 +1,12 @@
+# GitLab Agent for Kubernetes — staging cluster.
+#
+# The agent runs inside the cluster and opens an outbound connection to GitLab.
+# CI jobs then reach the cluster back down that tunnel, so no kubeconfig and no
+# inbound firewall rule is needed anywhere.
+#
+# ci_access lists which projects' pipelines may use this agent. What those
+# pipelines are allowed to do is decided separately, by the RBAC granted to the
+# agent's ServiceAccount in the cluster (see infra/ansible/roles/gitlab_agent).
+ci_access:
+  projects:
+    - id: oluwafemi.akinlosotu/fast-api-docker-traefik

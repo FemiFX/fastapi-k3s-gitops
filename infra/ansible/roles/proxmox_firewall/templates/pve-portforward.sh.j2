@@ -1,0 +1,54 @@
+#!/bin/sh
+# Managed by Ansible. Manual edits will be overwritten.
+#
+# Port forwarding from the public address to the production VM.
+#
+# This script is the ONLY place these rules are defined. It is run by Ansible
+# when the role applies, and by pve-portforward.service at boot, so what gets
+# tested is exactly what runs later. The previous arrangement used the Ansible
+# iptables module to apply them and netfilter-persistent to restore them -- two
+# mechanisms, one of them never exercised until a reboot, which is when it was
+# discovered not to work.
+#
+# Why not netfilter-persistent: "netfilter-persistent save" writes the whole
+# ruleset, including pve-firewall's PVEFW-* chains and their ipset references.
+# At boot it runs before pve-firewall, those ipsets do not exist yet, and
+# iptables-restore refuses the entire file -- so our rules were lost along with
+# everything else. iptables-restore is all or nothing.
+set -eu
+
+UPLINK="{{ firewall_uplink }}"
+INTERNAL="{{ firewall_internal_bridge }}"
+PUBLIC_IP="{{ firewall_public_ip }}"
+PROD_IP="{{ firewall_production_ip }}"
+SUBNET="{{ firewall_internal_subnet }}"
+
+# -C tests whether a rule is already present, so re-running adds nothing.
+# That is what makes this safe to run at boot and from Ansible alike.
+add() {
+  table="$1"; shift
+  chain="$1"; shift
+  iptables -t "$table" -C "$chain" "$@" 2>/dev/null || iptables -t "$table" -A "$chain" "$@"
+}
+
+for port in 80 443; do
+  # Inbound from the internet, sent to the production VM.
+  add nat PREROUTING -i "$UPLINK" -p tcp --dport "$port" \
+      -j DNAT --to-destination "$PROD_IP:$port"
+
+  # Let the forwarded traffic through the filter table.
+  add filter FORWARD -p tcp -d "$PROD_IP" --dport "$port" -j ACCEPT
+
+  # Hairpin: a pod resolving the public hostname gets the public IP and
+  # connects to it. That arrives on the internal bridge, so the rule above does
+  # not match. cert-manager checks its own ACME challenge this way.
+  add nat PREROUTING -i "$INTERNAL" -d "$PUBLIC_IP" -p tcp --dport "$port" \
+      -j DNAT --to-destination "$PROD_IP:$port"
+
+  # Without this the reply goes straight from the production VM to the
+  # requesting VM, which never saw a connection to that address and drops it.
+  add nat POSTROUTING -s "$SUBNET" -d "$PROD_IP" -p tcp --dport "$port" \
+      -j MASQUERADE
+done
+
+echo "Port forwarding applied for 80 and 443 to ${PROD_IP}."

@@ -1,0 +1,255 @@
+# kube-prometheus-stack on staging, installed and reconciled by Argo CD.
+#
+# A chart from a remote repository rather than a path in this one, so the
+# Application looks different: repoURL points at the Helm repository, chart
+# names the chart, and targetRevision is the CHART VERSION rather than a git
+# ref. Same object, different source type.
+#
+# Pinned to the version already proven on production, with the control-plane
+# scrape targets disabled and sizing that fits a 6 GB node. Tracking the latest
+# chart would quietly undo the reason for pinning anything: a rebuild is only
+# reproducible if it installs what was tested.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 89.2.2
+    helm:
+      releaseName: monitoring
+      values: |
+        # k3s runs the API server, controller-manager, scheduler, etcd and
+        # kube-proxy inside ONE process. The chart assumes they are separate
+        # and goes looking for four metrics endpoints that do not exist, so it
+        # creates targets that can never come up and alerts that fire about a
+        # cluster which is entirely healthy.
+        #
+        # Alerts that fire when nothing is wrong are worse than no alerts: they
+        # train everyone to ignore the channel.
+        kubeControllerManager:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeProxy:
+          enabled: false
+        kubeEtcd:
+          enabled: false
+
+        defaultRules:
+          create: true
+          rules:
+            etcd: false
+            kubeSchedulerAlerts: false
+            kubeControllerManager: false
+            kubeProxy: false
+
+        prometheus:
+          prometheusSpec:
+            retention: 7d
+            scrapeInterval: 30s
+            # By default the operator only picks up ServiceMonitors and rules
+            # carrying this release's own labels, and ignores everything else
+            # SILENTLY -- no error, no target, empty graphs, quiet alerts.
+            # Our rules are a separate Application, so this must be false.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            probeSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            resources:
+              requests:
+                cpu: 100m
+                memory: 512Mi
+              limits:
+                memory: 1500Mi
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: local-path
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests:
+                      storage: 8Gi
+
+        alertmanager:
+          # Staging used to have no receiver at all, on the reasoning that
+          # nobody is on call for it and a cluster we destroy on purpose would
+          # page somebody every time.
+          #
+          # A rebuild then left every application pod unable to start for nine
+          # hours, with two critical alerts firing in here the whole time, and
+          # not one of them reached a person. The noise argument was right; the
+          # conclusion drawn from it was too strong. "Do not page anyone" is not
+          # the same as "do not deliver anywhere".
+          #
+          # So: critical only, to a quiet channel of its own. Nobody has to
+          # watch it. What matters is that the path EXISTS, because a delivery
+          # path that has never carried anything is indistinguishable from one
+          # that cannot -- and staging is the cluster we rehearse on.
+          config:
+            route:
+              # Everything lands on "null" unless a route below claims it.
+              # Warnings and the Watchdog stay inside the cluster.
+              receiver: "null"
+              group_by: [alertname, namespace]
+              group_wait: 30s
+              group_interval: 5m
+              # Twelve hours, not the usual four. This channel is checked, not
+              # watched, so a repeat is a reminder rather than a page.
+              repeat_interval: 12h
+              routes:
+                - matchers: [severity="critical"]
+                  receiver: chat
+
+            receivers:
+              - name: "null"
+
+              - name: chat
+                # Mattermost accepts Slack-format payloads, so slack_configs
+                # points straight at an incoming webhook with no adapter.
+                slack_configs:
+                  # api_url_file, not api_url. The URL is a credential and
+                  # these values are reconciled from git, so the config lives
+                  # in git where it can be reviewed and the URL arrives in a
+                  # Secret that CI creates. Alertmanager reads the file when it
+                  # sends, so rotating the Secret needs no restart.
+                  - api_url_file: /etc/alertmanager/secrets/alertmanager-mattermost/url
+                    send_resolved: true
+                  # Deliberately no custom title or text, unlike production.
+                  #
+                  # Those use Alertmanager's own Go templates -- .Status and
+                  # friends, in double braces -- and this block does not go
+                  # straight to
+                  # Alertmanager. The chart runs the config through `tpl`,
+                  # which is Helm's Go template engine, so Helm would try to
+                  # resolve .Status against ITS context and find nothing.
+                  # Escaping it is possible and unpleasant.
+                  #
+                  # Alertmanager's default Slack message already names the
+                  # alert and its summary, the channel is staging's own, and
+                  # every alert carries namespace and severity labels. The
+                  # custom formatting was buying almost nothing and costing a
+                  # whole layer of escaping.
+
+          alertmanagerSpec:
+            # Mounted as an OPTIONAL volume rather than through
+            # alertmanagerSpec.secrets, which would make the Secret mandatory.
+            #
+            # That distinction is the whole lesson from the rebuild: a
+            # mandatory Secret that only CI creates means a freshly built
+            # cluster cannot start its own monitoring until a pipeline has run.
+            # Optional means Alertmanager comes up regardless, with an empty
+            # directory, and starts delivering as soon as the Secret appears.
+            #
+            # The cost is that between those two moments a critical alert would
+            # fail to send. Losing notifications for a few minutes on a cluster
+            # being rebuilt beats monitoring that cannot boot.
+            volumes:
+              - name: mattermost-webhook
+                secret:
+                  secretName: alertmanager-mattermost
+                  optional: true
+            volumeMounts:
+              - name: mattermost-webhook
+                mountPath: /etc/alertmanager/secrets/alertmanager-mattermost
+                readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 64Mi
+              limits:
+                memory: 256Mi
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: local-path
+                  accessModes: [ReadWriteOnce]
+                  resources:
+                    requests:
+                      storage: 2Gi
+
+        grafana:
+          # No adminPassword here -- a password in git is a password published.
+          # And not the chart's generated one either: that Secret is created
+          # with a NEW random value on every render, so every Argo CD sync
+          # rotated it away from the password Grafana had initialised with.
+          # Reconciliation needs rendering to be deterministic.
+          #
+          # So the chart is pointed at a Secret it does not own, created by
+          # sync:staging from a CI/CD variable. Config in git, credential in
+          # the pipeline -- the same split as the Alertmanager webhook.
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          defaultDashboardsTimezone: utc
+
+          # Loki, added as a second datasource so metrics and logs are in one
+          # place. Without this Grafana would still have no logs even with Loki
+          # running: a datasource is how Grafana learns something exists.
+          #
+          # Nothing secret here -- it is a ClusterIP inside the same namespace,
+          # and Loki runs with auth_enabled: false because there is one tenant.
+          additionalDataSources:
+            - name: Loki
+              type: loki
+              uid: loki
+              access: proxy
+              url: http://loki.monitoring.svc.cluster.local:3100
+              jsonData:
+                # A query that matches a whole namespace for a day can return
+                # a great deal. This is the browser's protection, not Loki's.
+                maxLines: 1000
+          service:
+            type: ClusterIP
+          persistence:
+            enabled: true
+            storageClassName: local-path
+            size: 2Gi
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+
+        prometheus-node-exporter:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+
+        kube-state-metrics:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 192Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      - CreateNamespace=true
+      # The chart's CRDs are far too large for a client-side apply, which
+      # stores the previous manifest in an annotation and hits the 256 kB
+      # limit. Server-side apply has no such limit.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

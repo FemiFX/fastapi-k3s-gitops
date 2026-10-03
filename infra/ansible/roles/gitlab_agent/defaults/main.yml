@@ -1,0 +1,27 @@
+---
+# GitLab's Kubernetes Agent Server. wss:// because the agent holds a websocket
+# open to it. This is an outbound connection, which is why no inbound firewall
+# rule is needed.
+gitlab_kas_address: "wss://kas.gitlab.com"
+
+# Pinned for reproducibility. Newer versions: https://charts.gitlab.io
+gitlab_agent_chart_version: "2.30.0"
+
+gitlab_agent_namespace: gitlab-agent
+gitlab_agent_release: gitlab-agent
+gitlab_agent_service_account: gitlab-agent
+
+# The one namespace outside its own that the pipeline may write Secrets into,
+# and exactly which Secrets, by name. See the rbac template for why that grant
+# has to be split in two.
+monitoring_namespace: monitoring
+monitoring_ci_secrets:
+  - alertmanager-mattermost
+  - grafana-admin
+
+
+# Supplied at run time, never committed. Each cluster has its own agent and so
+# its own token, taken from GitLab under
+# Operate > Kubernetes clusters > Connect a cluster:
+#   -e gitlab_agent_token=glagent-xxxxx
+gitlab_agent_token: ""

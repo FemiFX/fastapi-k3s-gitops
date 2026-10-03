@@ -1,0 +1,13 @@
+---
+# What sshd should allow for root.
+#
+# "no" everywhere except the Proxmox host, where root is the ONLY account and
+# the machine is also the jump host for every VM. Setting "no" there would end
+# all access to the hypervisor and, with it, the route to the VMs behind it.
+# The inventory overrides this to "prohibit-password" for the proxmox group:
+# key-based root login stays, password login does not.
+#
+# This is the classic remote-hardening trap. The change applies cleanly, the
+# task reports "changed", and you find out it was wrong the next time you try
+# to log in.
+sshd_permit_root_login: "no"

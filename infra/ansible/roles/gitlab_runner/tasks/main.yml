@@ -1,0 +1,123 @@
+---
+# Installs and registers a self-hosted GitLab Runner.
+#
+# Why self-hosted: GitLab's shared runners live on the public internet and
+# cannot reach our k3s clusters, which sit on a private network behind the
+# Proxmox host. This runner sits inside that network. It only makes outbound
+# connections to GitLab, so no inbound firewall holes are needed.
+
+- name: Stop early if no registration token was supplied
+  ansible.builtin.assert:
+    that:
+      - gitlab_registration_token | default('') | length > 0
+    fail_msg: >-
+      Set gitlab_registration_token. Take it from your GitLab project under
+      Settings > CI/CD > Runners > New project runner, then run:
+      ansible-playbook site.yml --tags runner
+      -e gitlab_registration_token=$GITLAB_TOKEN
+
+# --- Docker, used both to build images and as the runner's executor ---------
+
+- name: Add the Docker apt key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  become: true
+
+- name: Add the Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+  become: true
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+    state: present
+    update_cache: true
+  become: true
+
+# --- kubectl, used by the deploy jobs --------------------------------------
+# helm arrives with the role's helm dependency, see meta/main.yml.
+
+- name: Install kubectl
+  ansible.builtin.get_url:
+    url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+    dest: /usr/local/bin/kubectl
+    mode: "0755"
+  become: true
+
+# --- GitLab Runner ---------------------------------------------------------
+
+- name: Add the GitLab Runner apt key
+  ansible.builtin.get_url:
+    url: https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+    dest: /etc/apt/keyrings/gitlab-runner.asc
+    mode: "0644"
+  become: true
+
+- name: Add the GitLab Runner apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/gitlab-runner.asc]
+      https://packages.gitlab.com/runner/gitlab-runner/ubuntu/
+      {{ ansible_distribution_release }} main
+    filename: gitlab-runner
+    state: present
+  become: true
+
+- name: Install GitLab Runner
+  ansible.builtin.apt:
+    name: gitlab-runner
+    state: present
+    update_cache: true
+  become: true
+
+- name: Let the runner use Docker
+  ansible.builtin.user:
+    name: gitlab-runner
+    groups: docker
+    append: true
+  become: true
+
+- name: Check whether this runner is already registered
+  ansible.builtin.command: grep -q "{{ gitlab_url }}" /etc/gitlab-runner/config.toml
+  register: runner_registered
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Register the runner
+  # The shell executor is used for deploy jobs because they need the host's
+  # network path to the clusters. Build jobs run on GitLab's shared runners.
+  ansible.builtin.command:
+    argv:
+      - gitlab-runner
+      - register
+      - --non-interactive
+      - --url={{ gitlab_url }}
+      - --token={{ gitlab_registration_token }}
+      - --executor=docker
+      - --docker-image=alpine:3.20
+      - --docker-privileged=false
+      - --docker-network-mode=host
+      - --description={{ inventory_hostname }}
+  become: true
+  when: runner_registered.rc != 0
+  no_log: true
+  changed_when: true
+
+- name: Make sure the runner service is running
+  ansible.builtin.systemd:
+    name: gitlab-runner
+    state: started
+    enabled: true
+  become: true

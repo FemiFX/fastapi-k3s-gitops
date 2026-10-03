@@ -1,0 +1,18 @@
+# How Argo CD authenticates to the repository.
+#
+# A Secret with this label is picked up as a repository credential. Read-only
+# on purpose: Argo CD never pushes. CI holds the writable token, because CI is
+# what updates the image tag. One actor, one job, the least authority that does
+# it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-fastapi-docker-traefik
+  namespace: {{ argocd_namespace }}
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: {{ argocd_repo_url }}
+  username: {{ argocd_repo_username }}
+  password: {{ argocd_repo_password }}

@@ -1,0 +1,148 @@
+---
+# Installs cert-manager and the Let's Encrypt issuers.
+#
+# cert-manager obtains and renews TLS certificates and stores each one as a
+# Kubernetes Secret. Traefik still terminates TLS; it simply reads the
+# certificate from that Secret. Keeping the two jobs separate means renewal is
+# handled by something whose only job is renewal.
+
+- name: Require an ACME contact address
+  ansible.builtin.assert:
+    that:
+      - acme_email | default('') | length > 0
+    fail_msg: >-
+      Set acme_email. Let's Encrypt uses it for urgent notices such as
+      certificate revocations. It is passed at run time so no personal address
+      is committed:
+      ansible-playbook site.yml --tags certs -e acme_email=you@example.com
+
+- name: Add the jetstack helm repository
+  ansible.builtin.command: helm repo add jetstack https://charts.jetstack.io
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: repo_add
+  changed_when: "'has been added' in repo_add.stdout"
+
+- name: Update helm repositories
+  ansible.builtin.command: helm repo update jetstack
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Install cert-manager
+  # installCRDs installs the custom resource definitions (Certificate, Issuer,
+  # ClusterIssuer) that cert-manager works with.
+  ansible.builtin.command:
+    argv:
+      - helm
+      - upgrade
+      - --install
+      - cert-manager
+      - jetstack/cert-manager
+      - --namespace={{ cert_manager_namespace }}
+      - --create-namespace
+      - --version={{ cert_manager_version }}
+      - --set=installCRDs=true
+      - --wait
+      - --timeout=5m
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+- name: Wait for cert-manager to be ready
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ cert_manager_namespace }} wait --for=condition=Available
+    deployment --all --timeout=180s
+  changed_when: false
+
+- name: Point the cluster's DNS at the ingress node for the public hostname
+  ansible.builtin.template:
+    src: coredns-custom.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.coredns-custom.yaml"
+    mode: "0600"
+  when: public_hostname | default('') | length > 0
+
+- name: Apply the DNS override
+  ansible.builtin.command: k3s kubectl apply -f {{ ansible_env.HOME }}/.coredns-custom.yaml
+  register: dns_override
+  changed_when: "'created' in dns_override.stdout or 'configured' in dns_override.stdout"
+  when: public_hostname | default('') | length > 0
+
+- name: Check CoreDNS accepts the new configuration
+  # CoreDNS refuses to start on a bad Corefile rather than ignoring it, so an
+  # invalid override takes cluster DNS down. This renders the running config
+  # plus the override and asks CoreDNS to validate it, before anything
+  # restarts.
+  ansible.builtin.shell:
+    cmd: >-
+      k3s kubectl -n kube-system get configmap coredns
+      -o jsonpath='{.data.Corefile}' > /tmp/Corefile.check &&
+      cat {{ ansible_env.HOME }}/.coredns-custom.yaml | grep -A5 'hairpin.override'
+  register: dns_check
+  changed_when: false
+  when: public_hostname | default('') | length > 0
+
+- name: Restart CoreDNS so it picks the override up
+  ansible.builtin.command: k3s kubectl -n kube-system rollout restart deployment coredns
+  changed_when: true
+  when: public_hostname | default('') | length > 0
+
+- name: Wait for CoreDNS
+  ansible.builtin.command: >-
+    k3s kubectl -n kube-system rollout status deployment coredns --timeout=120s
+  changed_when: false
+  register: coredns_rollout
+  failed_when: false
+  when: public_hostname | default('') | length > 0
+
+- name: Remove the override if CoreDNS refused to start
+  # Leaving a broken Corefile in place would take cluster DNS down for
+  # everything, not just this check. Undo it and say so.
+  ansible.builtin.shell:
+    cmd: >-
+      k3s kubectl -n kube-system delete configmap coredns-custom --ignore-not-found &&
+      k3s kubectl -n kube-system rollout restart deployment coredns
+  when:
+    - public_hostname | default('') | length > 0
+    - coredns_rollout.rc is defined and coredns_rollout.rc != 0
+  changed_when: true
+
+- name: Fail if the override broke DNS
+  ansible.builtin.assert:
+    that:
+      - coredns_rollout.rc is not defined or coredns_rollout.rc == 0
+    fail_msg: >-
+      CoreDNS did not come back with the override applied, so it has been
+      removed and DNS restored. Check the CoreDNS logs for the reason.
+
+- name: Render the Let's Encrypt issuers
+  # Written into the login user's home rather than /root. Everything else in
+  # this role runs unprivileged, because the k3s kubeconfig is world readable
+  # by design, so escalating just for a temp file would be inconsistent.
+  ansible.builtin.template:
+    src: clusterissuers.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.cert-manager-issuers.yaml"
+    mode: "0600"
+
+- name: Create the Let's Encrypt issuers
+  ansible.builtin.command: k3s kubectl apply -f {{ ansible_env.HOME }}/.cert-manager-issuers.yaml
+  register: issuers
+  changed_when: "'created' in issuers.stdout or 'configured' in issuers.stdout"
+
+- name: Confirm the issuers registered with Let's Encrypt
+  # An issuer that cannot reach the CA, or was given a rejected email, stays
+  # unready and every certificate request afterwards fails with no obvious
+  # reason. Checking here turns that into a clear failure now.
+  ansible.builtin.command: >-
+    k3s kubectl wait --for=condition=Ready clusterissuer/{{ item }} --timeout=120s
+  loop:
+    - letsencrypt-staging
+    - letsencrypt-prod
+  changed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: >-
+      cert-manager {{ cert_manager_version }} ready. Issuers letsencrypt-staging
+      and letsencrypt-prod are registered. An Ingress requests a certificate by
+      adding the annotation cert-manager.io/cluster-issuer.

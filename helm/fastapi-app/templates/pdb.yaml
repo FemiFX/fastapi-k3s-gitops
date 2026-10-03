@@ -1,0 +1,23 @@
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicaCount) 1) -}}
+# A PodDisruptionBudget governs *voluntary* disruption: draining a node for
+# maintenance, or an upgrade that evicts Pods. Kubernetes will refuse an
+# eviction that would breach the budget, so a drain waits rather than taking
+# the last replica with it.
+#
+# It does nothing about involuntary disruption. A node that dies takes its Pods
+# with it whatever the budget says.
+#
+# Guarded on replicaCount, because minAvailable: 1 with a single replica means
+# no eviction is ever permitted and a drain hangs indefinitely.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "fastapi-app.selectorLabels" . | nindent 6 }}
+{{- end }}

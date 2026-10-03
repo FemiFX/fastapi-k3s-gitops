@@ -1,0 +1,17 @@
+# Managed by Ansible. Manual edits will be overwritten.
+#
+# Host level. When the firewall is on, the host's input policy is DROP already,
+# so anything not listed below is refused and no policy option is needed here.
+# policy_in and policy_out are datacenter settings; pve-firewall rejects them in
+# this file with "can't parse option".
+[OPTIONS]
+
+enable: {{ 1 if firewall_enable else 0 }}
+
+[RULES]
+
+{% for rule in firewall_allowed_tcp_ports %}
+IN ACCEPT -p tcp -dport {{ rule.port }} -log nolog # {{ rule.comment }}
+{% endfor %}
+# Ping is allowed. It is harmless and makes "is the host up?" answerable.
+IN ACCEPT -p icmp -log nolog # ICMP

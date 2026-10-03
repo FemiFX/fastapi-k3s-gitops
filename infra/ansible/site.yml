@@ -1,0 +1,96 @@
+---
+# Full configuration run. Safe to re-run: every role is idempotent.
+#
+#   ansible-playbook site.yml
+#
+# Run one part only with tags, for example:
+#   ansible-playbook site.yml --tags k3s
+#
+# The runner play is tagged "never", so it is skipped unless asked for by name.
+# It needs a GitLab runner token, which is passed in at run time:
+#   ansible-playbook site.yml --tags runner \
+#     -e gitlab_registration_token=$GITLAB_REGISTRATION_TOKEN
+
+- name: Base configuration for every machine
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: common
+      tags: [common]
+
+- name: Install the k3s control planes
+  hosts: k3s_servers
+  gather_facts: true
+  roles:
+    - role: k3s_server
+      tags: [k3s, k3s-server]
+
+- name: Join the production worker
+  hosts: prod_agent
+  gather_facts: true
+  roles:
+    - role: k3s_agent
+      tags: [k3s, k3s-agent]
+
+- name: Set up the self-hosted GitLab Runner
+  hosts: ci_runner
+  gather_facts: true
+  roles:
+    - role: gitlab_runner
+      tags: [never, runner]
+
+- name: Install the GitLab Agent for Kubernetes
+  # Tagged "never", so it only runs when asked for by name. Each cluster has
+  # its own agent and its own token, so run it one host at a time:
+  #   ansible-playbook site.yml --tags agent --limit staging
+  #     -e gitlab_agent_token=glagent-xxxxx
+  hosts: k3s_servers
+  gather_facts: true
+  roles:
+    - role: gitlab_agent
+      tags: [never, agent]
+
+- name: Firewall and port forwarding on the Proxmox host
+  # Tagged "never": enabling a firewall on a remote host can lock you out, so
+  # it only runs when asked for by name. Run once to review the rules, then
+  # again with -e firewall_enable=true to apply them.
+  #   ansible-playbook site.yml --tags firewall
+  #   ansible-playbook site.yml --tags firewall -e firewall_enable=true
+  hosts: proxmox
+  gather_facts: true
+  roles:
+    - role: proxmox_firewall
+      tags: [never, firewall]
+
+- name: Install Argo CD and hand it the root Application
+  # Tagged "never": a bootstrap, run deliberately, once per cluster. After this
+  # the cluster's contents are described in gitops/ and Argo CD keeps them
+  # true, so changing what runs is a commit rather than another Ansible run.
+  #
+  # Read-only repository credentials are passed at run time:
+  #   ansible-playbook site.yml --tags argocd --limit staging   #     -e argocd_repo_username=... -e argocd_repo_password=...
+  hosts: k3s_servers
+  gather_facts: true
+  roles:
+    - role: argocd
+      tags: [never, argocd]
+
+- name: Install the monitoring stack
+  # Tagged "never": it is a large install and each cluster is done on purpose.
+  # Run it one host at a time, and pass the Grafana password at run time:
+  #   ansible-playbook site.yml --tags monitoring --limit staging   #     -e grafana_admin_password=...
+  hosts: k3s_servers
+  gather_facts: true
+  roles:
+    - role: monitoring
+      tags: [never, monitoring]
+
+- name: Install cert-manager and the Let's Encrypt issuers
+  # Tagged "never": run it explicitly, and pass the ACME contact address so no
+  # personal email is committed.
+  #   ansible-playbook site.yml --tags certs --limit prod-server   #     -e acme_email=you@example.com
+  hosts: k3s_servers
+  gather_facts: true
+  roles:
+    - role: cert_manager
+      tags: [never, certs]

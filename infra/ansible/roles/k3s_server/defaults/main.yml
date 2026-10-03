@@ -1,0 +1,8 @@
+---
+# How many Traefik replicas k3s should run. One is right for a single-node
+# cluster. Production has two nodes, so two replicas mean a crashed ingress pod
+# does not take the site down with it.
+#
+# This does not survive losing the whole server node: the Proxmox host NATs
+# ports 80 and 443 to one address, so that node is still the only way in.
+traefik_replicas: 1

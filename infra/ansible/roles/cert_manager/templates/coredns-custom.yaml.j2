@@ -1,0 +1,24 @@
+# Split-horizon DNS for the cluster.
+#
+# cert-manager checks its own ACME challenge before asking Let's Encrypt to
+# validate. From inside the cluster the public hostname resolves to the public
+# IP, and reaching that from a node means leaving and being NATed back in. That
+# works from other machines but not from the node that is itself the
+# destination, which is where cert-manager runs, so the check never passed.
+#
+# The query is rewritten to the in-cluster Traefik service instead, which
+# removes NAT from the path entirely. The HTTP Host header is untouched, so
+# Traefik still routes by hostname and the ingress matches as normal.
+#
+# rewrite is used rather than the hosts plugin because k3s already defines a
+# hosts block for /etc/coredns/NodeHosts, and CoreDNS refuses to start with two
+# of them: "plugin/hosts: this plugin can only be used once per Server Block".
+# rewrite may appear as many times as needed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  hairpin.override: |
+    rewrite name exact {{ public_hostname }} {{ ingress_service }}

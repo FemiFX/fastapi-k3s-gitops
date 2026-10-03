@@ -1,0 +1,193 @@
+# Grafana Alloy on production: the thing that actually collects the logs.
+#
+# Loki stores logs; it does not go and find them. Something has to run on every
+# node, notice which containers exist, read what they write, attach the labels
+# that make a log line findable, and push it. That is Alloy. It replaces
+# Promtail, which Grafana has retired.
+#
+# A DaemonSet, because logs are per-node: one collector per machine, and a new
+# node gets one automatically. Production has two nodes, so there are two
+# collectors -- and prod-agent's logs would be invisible without the second.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: alloy
+  namespace: argocd
+  annotations:
+    # Wave 1: after Loki, so the first thing Alloy does is not fail to connect.
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: alloy
+    targetRevision: 1.12.1
+    helm:
+      releaseName: alloy
+      values: |
+        controller:
+          type: daemonset
+          volumes:
+            extra:
+              - name: alloy-storage
+                emptyDir: {}
+
+        alloy:
+          # Alloy's own config language. Each block is a component; components
+          # are wired together by naming each other's outputs, so this reads as
+          # a pipeline: discover -> label -> read -> parse -> ship.
+          configMap:
+            content: |
+              // 1. What exists. Asks the Kubernetes API for pods. Needs only
+              //    list/watch on pods, which the chart's RBAC already grants.
+              discovery.kubernetes "pods" {
+                role = "pod"
+              }
+
+              // 2. What to call it, and where its file is.
+              //
+              //    These labels ARE the index. Keep them few and low
+              //    cardinality: namespace, pod, container, app. Adding
+              //    something like a request id here would create one Loki
+              //    stream per request and fall over within hours.
+              discovery.relabel "pods" {
+                targets = discovery.kubernetes.pods.targets
+
+                rule {
+                  source_labels = ["__meta_kubernetes_namespace"]
+                  target_label  = "namespace"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_name"]
+                  target_label  = "pod"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_container_name"]
+                  target_label  = "container"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+                  target_label  = "app"
+                }
+
+                // The kubelet writes container output to
+                // /var/log/pods/<namespace>_<pod>_<uid>/<container>/*.log
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+                  separator     = "/"
+                  action        = "replace"
+                  replacement   = "/var/log/pods/*$1/*.log"
+                  target_label  = "__path__"
+                }
+              }
+
+              // 3. Turn those patterns into actual files.
+              //
+              //    This component exists because loki.source.file does NOT
+              //    expand globs. Given a path with an asterisk in it, it calls
+              //    stat on that literal string and fails:
+              //
+              //      stat /var/log/pods/*<uid>/<container>/*.log:
+              //      no such file or directory
+              //
+              //    Promtail did its own globbing, so every config written for
+              //    Promtail assumes __path__ can be a pattern. Alloy split
+              //    that job into its own component. Configs ported from
+              //    Promtail run, discover every pod, log one error per
+              //    container and ship nothing.
+              local.file_match "pods" {
+                path_targets = discovery.relabel.pods.output
+                // Re-scan for new files. A pod created between scans is
+                // picked up within this window.
+                sync_period = "10s"
+              }
+
+              // 4. Read the files.
+              //
+              //    Reading FILES rather than streaming from the Kubernetes API
+              //    is the important choice here. A file outlives the container
+              //    that wrote it, so the logs of a pod that crashed, or of a
+              //    backup Job that ran for nine seconds at 3am, are still on
+              //    disk to be collected. Streaming from the API ends when the
+              //    container ends.
+              loki.source.file "pods" {
+                targets    = local.file_match.pods.targets
+                forward_to = [loki.process.pods.receiver]
+              }
+
+              // 5. Parse the container runtime's wrapper.
+              //
+              //    containerd does not write your log line to the file. It
+              //    writes "<timestamp> <stream> <flags> <your line>". Without
+              //    this stage every line in Grafana carries that prefix and
+              //    the real timestamp is ignored in favour of collection time.
+              loki.process "pods" {
+                stage.cri {}
+                forward_to = [loki.write.default.receiver]
+              }
+
+              // 6. Ship it. No gateway in front of Loki, so this is the
+              //    service directly.
+              loki.write "default" {
+                endpoint {
+                  url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+                }
+              }
+
+          # /var/log from the host, which is where the files in step 4 are.
+          #
+          # And a scratch volume at /tmp/alloy, Alloy's storage path -- it
+          # keeps its file-tail positions there so a restart resumes where it
+          # left off instead of re-shipping everything. The root filesystem is
+          # read-only below, so the one directory it legitimately writes gets
+          # an emptyDir. Without this the container dies at startup:
+          #   mkdir /tmp/alloy: read-only file system
+          mounts:
+            varlog: true
+            extra:
+              - name: alloy-storage
+                mountPath: /tmp/alloy
+
+          # Reading another process's log files means reading root-owned files
+          # on the host. Stated rather than hidden: this is the one workload in
+          # the cluster that runs as root, and it is why log collection is
+          # always a privileged component.
+          #
+          # The compensation is that it is the only thing it does. No network
+          # listener, no writes to the host, and one host path mounted.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+
+        # The chart's optional bundled service monitor is left off; Prometheus
+        # already scrapes what matters and this node has no room for extras.
+        serviceMonitor:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

@@ -1,0 +1,13 @@
+---
+# Pinned so every cluster gets the same version and a rebuild is reproducible.
+# Check newer releases at https://update.k3s.io/v1-release/channels
+k3s_version: "v1.36.3+k3s1"
+
+# The Proxmox host. VMs reach the outside world through it, and it is the SSH
+# jump host for anything connecting from outside.
+proxmox_host_ip: "203.0.113.10"
+
+# Where the authorised public keys live. Terraform reads the same directory
+# for cloud-init, so the two cannot disagree, and adding a person is dropping
+# in a file rather than editing two tools.
+ssh_keys_dir: "{{ inventory_dir }}/../ssh-keys"

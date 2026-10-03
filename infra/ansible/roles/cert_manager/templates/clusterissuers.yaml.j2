@@ -1,0 +1,36 @@
+# A ClusterIssuer tells cert-manager how to obtain certificates. It is
+# cluster-wide, so any namespace can reference it.
+#
+# HTTP-01 works like this: cert-manager creates a temporary Ingress on the same
+# hostname, Let's Encrypt fetches a token from it over port 80, and that proves
+# we control the name. It needs port 80 reachable from the internet, which is
+# why the forwarding on the Proxmox host had to exist first.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: {{ acme_staging_server }}
+    email: {{ acme_email }}
+    privateKeySecretRef:
+      name: letsencrypt-staging-account
+    solvers:
+      - http01:
+          ingress:
+            class: {{ acme_ingress_class }}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: {{ acme_production_server }}
+    email: {{ acme_email }}
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            class: {{ acme_ingress_class }}

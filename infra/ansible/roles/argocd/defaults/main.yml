@@ -1,0 +1,45 @@
+---
+# Argo CD: the controller that makes the cluster match the repository.
+#
+# Kubernetes already reconciles live objects towards the spec in etcd -- kill a
+# pod and the Deployment controller replaces it. Nothing reconciles that spec
+# towards git. Argo CD closes that loop: it reads the repository every few
+# minutes, renders what is there, compares it with the cluster, and corrects
+# the difference.
+#
+# CI deploys. Argo CD reconciles. Those are different verbs: a pipeline acts
+# once and stops existing, while this keeps checking forever.
+
+# Left empty on a first install: the current chart version cannot be known in
+# advance. The role prints what it resolved; pin it here afterwards so the
+# install is reproducible.
+argocd_chart_version: ""
+
+argocd_namespace: argocd
+argocd_release: argocd
+
+# Sized for a node already running the application, PostgreSQL and
+# kube-prometheus-stack. Chart defaults assume considerably more room.
+argocd_controller_memory_limit: 1Gi
+argocd_repo_server_memory_limit: 512Mi
+argocd_server_memory_limit: 256Mi
+
+# How often the repository is polled. Argo CD also accepts webhooks, which make
+# it near-instant, but polling needs nothing opened towards the cluster.
+argocd_reconcile_timeout: 180s
+
+# The repository Argo CD reads. Read-only credentials: it never writes.
+# Supplied at run time, never committed:
+#   -e argocd_repo_username=... -e argocd_repo_password=...
+argocd_repo_url: "https://gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik.git"
+argocd_repo_username: ""
+argocd_repo_password: ""
+
+# Which directory under gitops/apps this cluster should reconcile. Set per host
+# in the inventory, so each cluster watches only its own environment and no
+# cluster holds credentials for another.
+argocd_environment: "{{ app_namespace }}"
+
+# The branch Argo CD follows. Production tracks the production branch, staging
+# tracks main, exactly as the deploy jobs did.
+argocd_target_revision: "{{ 'production' if app_namespace == 'production' else 'main' }}"

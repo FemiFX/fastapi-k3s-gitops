@@ -1,0 +1,34 @@
+---
+# Puts the helm binary on a machine. Nothing else.
+#
+# Five roles here shell out to `helm`. Three of them used to install it
+# themselves with a copy of these two tasks, and two assumed somebody else had
+# already done it -- which was true only because those roles had always been
+# run in a particular order on a long-lived machine. On a cluster built from
+# nothing, `argocd` ran first and failed with `No such file or directory:
+# helm`.
+#
+# So this is a dependency in meta/main.yml rather than a play in site.yml: a
+# role that needs helm says so, and gets it, whatever order things run in.
+
+- name: Download and unpack helm
+  ansible.builtin.unarchive:
+    src: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    dest: /tmp
+    remote_src: true
+    creates: /tmp/linux-amd64/helm
+  become: true
+
+- name: Put helm on the path
+  ansible.builtin.copy:
+    src: /tmp/linux-amd64/helm
+    dest: /usr/local/bin/helm
+    mode: "0755"
+    remote_src: true
+  become: true
+
+- name: Confirm helm runs
+  # Cheap, and it turns "the download half-worked" into a failure here rather
+  # than an obscure one three tasks into whichever role asked for it.
+  ansible.builtin.command: helm version --short
+  changed_when: false

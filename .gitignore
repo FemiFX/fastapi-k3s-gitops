@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+.env
+.env.*
+!.env.example
+
+traefik-public-certificates/
+
+# Terraform
+# State can contain secrets and is the record of real infrastructure.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+# Variable files hold the Proxmox API token. The example file is safe.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+# The lock file IS committed on purpose: it pins provider checksums.
+!.terraform.lock.hcl
+
+# Ansible
+# kubeconfigs contain cluster admin credentials
+infra/ansible/kubeconfig-*.yaml
+*.retry
+
+# Host-specific inventory and SSH config. The .example files are safe;
+# the real ones name a machine and the account used to reach it.
+infra/ansible/inventory.ini
+infra/ansible/ssh_config

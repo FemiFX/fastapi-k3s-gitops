@@ -1,0 +1,13 @@
+# Development and CI dependencies.
+# Install alongside requirements.txt: pip install -r requirements-dev.txt
+-r requirements.txt
+
+# Testing
+pytest==8.3.4
+# Starlette's TestClient is built on httpx, and recent versions need a recent
+# httpx.
+httpx>=0.27,<1
+
+# Quality
+black==23.12.1
+ruff==0.1.14

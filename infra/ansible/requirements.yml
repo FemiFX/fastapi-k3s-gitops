@@ -1,0 +1,16 @@
+---
+# Ansible collections this project uses.
+#
+# The full "ansible" package bundles these, so a workstation install usually
+# has them already. A pipeline installing ansible-core does not, and the
+# failure is a confusing "couldn't resolve module" rather than "collection
+# missing" -- so they are declared here and installed explicitly.
+#
+#   ansible-galaxy collection install -r requirements.yml
+collections:
+  # authorized_key, for the pipeline SSH key in the common role.
+  - name: ansible.posix
+    version: ">=1.5.0"
+  # Assorted modules used across the roles.
+  - name: community.general
+    version: ">=8.0.0"

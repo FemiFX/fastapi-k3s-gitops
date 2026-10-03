@@ -1,0 +1,15 @@
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled -}}
+# Redirects plain HTTP to HTTPS. Port 80 still has to stay open: Let's Encrypt
+# answers its HTTP-01 challenge over it, and cert-manager's temporary challenge
+# ingress takes priority over this redirect while a certificate is being issued.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "fastapi-app.fullname" . }}-redirect-https
+  labels:
+    {{- include "fastapi-app.labels" . | nindent 4 }}
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+{{- end }}

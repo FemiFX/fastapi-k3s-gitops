@@ -1,0 +1,21 @@
+---
+# Pinned for reproducibility. Releases: github.com/cert-manager/cert-manager
+cert_manager_version: "v1.21.1"
+cert_manager_namespace: cert-manager
+
+# Let's Encrypt endpoints. Staging issues untrusted certificates but has far
+# looser rate limits, so it is used to prove the whole flow works before asking
+# the production CA for a real one.
+acme_staging_server: "https://acme-staging-v02.api.letsencrypt.org/directory"
+acme_production_server: "https://acme-v02.api.letsencrypt.org/directory"
+
+# The ingress class that answers the HTTP-01 challenge. k3s ships Traefik.
+acme_ingress_class: traefik
+
+# Supplied at run time so no personal address is committed:
+#   -e acme_email=you@example.com
+acme_email: ""
+
+# The in-cluster address of the ingress controller. Pods asking for the public
+# hostname are pointed here instead of at the public IP.
+ingress_service: "traefik.kube-system.svc.cluster.local"

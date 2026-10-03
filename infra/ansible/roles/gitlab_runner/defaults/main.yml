@@ -1,0 +1,10 @@
+---
+gitlab_url: "https://gitlab.com/"
+
+# Pinned for reproducibility.
+kubectl_version: "v1.36.3"
+
+# Supplied at run time, never committed. Take it from the GitLab project under
+# Settings > CI/CD > Runners > New project runner:
+#   -e gitlab_registration_token=$GITLAB_TOKEN
+gitlab_registration_token: ""

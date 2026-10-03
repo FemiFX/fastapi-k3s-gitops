@@ -1,0 +1,157 @@
+# Loki on production.
+#
+# Proven on staging first, for a reason worth keeping in mind: the collector
+# that feeds this runs as root on every node (see alloy.yaml). Staging carried
+# that risk for a week before production did.
+#
+# Loki is not Elasticsearch. It does NOT index the text of your logs. It indexes
+# a small set of labels -- namespace, pod, container -- and stores the log lines
+# themselves as compressed chunks. A query picks a stream by label and then
+# greps the chunks.
+#
+# That is the whole design, and it is why Loki runs on a 6 GB node while an
+# ELK stack would not. It also sets the one rule that matters: keep the number
+# of label combinations small. A label with many possible values -- a request
+# id, a user id, a timestamp -- creates a separate stream for every value and
+# will bring Loki down. Put those in the log line, where grep is cheap, not in
+# a label, where an index entry is expensive.
+#
+# SingleBinary mode because this is one small node. The chart's default
+# deployment mode splits Loki into read, write and backend tiers with caches in
+# front, which is correct at scale and absurd here.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+  annotations:
+    # Wave 0: Alloy is wave 1, so there is somewhere to send logs before
+    # anything starts sending them.
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: loki
+    # CHART VERSION, not a git ref -- this is a chart repository source.
+    targetRevision: 7.3.0
+    helm:
+      releaseName: loki
+      values: |
+        deploymentMode: SingleBinary
+
+        loki:
+          # No multi-tenancy. One cluster, one tenant, and auth_enabled: true
+          # would mean every query and every push needs an X-Scope-OrgID header
+          # for no benefit here.
+          auth_enabled: false
+
+          commonConfig:
+            # One copy of each chunk. Anything higher needs more than one
+            # ingester, and there is one node.
+            replication_factor: 1
+
+          storage:
+            type: filesystem
+
+          # The chart requires this explicitly now rather than defaulting it,
+          # because changing a schema silently would orphan existing data.
+          # v13 + tsdb is the current pairing.
+          schemaConfig:
+            configs:
+              - from: "2024-04-01"
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+
+          limits_config:
+            # Fourteen days on production, twice staging. An incident here may
+            # not be noticed for a day and investigated for another; seven days
+            # of logs is thin for a post-mortem. Logs are much larger than
+            # metrics, so this is still the first number to lower if the disk
+            # starts filling.
+            retention_period: 336h
+            # Refuse anything older than the retention window rather than
+            # accepting writes that will be deleted immediately.
+            reject_old_samples: true
+            reject_old_samples_max_age: 336h
+            # A backstop against one chatty container filling the disk. It
+            # drops lines and says so, which is better than silently running
+            # out of space and taking the node's other workloads with it.
+            ingestion_rate_mb: 4
+            ingestion_burst_size_mb: 6
+            max_query_series: 500
+
+          compactor:
+            working_directory: /var/loki/compactor
+            # Retention is NOT automatic. Without this the retention_period
+            # above is decoration and the disk grows forever.
+            retention_enabled: true
+            delete_request_store: filesystem
+
+        singleBinary:
+          replicas: 1
+          persistence:
+            enabled: true
+            storageClassName: local-path
+            # Twice staging, for twice the retention.
+            size: 20Gi
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+
+        # The other deployment modes, explicitly off. The chart will happily
+        # run SingleBinary *and* leave these at their defaults, which produces
+        # a pile of pods that never become ready.
+        backend:
+          replicas: 0
+        read:
+          replicas: 0
+        write:
+          replicas: 0
+
+        # memcached in front of chunks and query results. Each one asks for
+        # around a gigabyte by default, which is most of this node.
+        chunksCache:
+          enabled: false
+        resultsCache:
+          enabled: false
+
+        # A synthetic writer that checks Loki is working by writing to it.
+        # Useful at scale, and here it would be a permanent background load
+        # plus a permanently busy stream.
+        lokiCanary:
+          enabled: false
+
+        test:
+          enabled: false
+
+        # An nginx in front, for routing between the split components. There
+        # are no split components, so Alloy and Grafana talk to the service
+        # directly.
+        gateway:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

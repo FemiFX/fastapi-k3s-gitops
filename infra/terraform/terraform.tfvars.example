@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+# Alternatively export TF_VAR_proxmox_api_token / TF_VAR_ssh_public_key,
+# which is what CI will do.
+
+# Created with: pveum user token add terraform@pve provider --privsep 0
+# Format: user@realm!tokenid=secret
+proxmox_api_token = "terraform@pve!provider=00000000-0000-0000-0000-000000000000"
+
+# Contents of your public key, e.g. ~/.ssh/id_ed25519.pub
+ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+
+# The pipeline key is NOT set here. It is read from infra/ci-ansible.pub,
+# which Ansible reads too, so the two can never disagree.
+
+# Defaults in variables.tf already match this server; override only if needed.
+# proxmox_endpoint = "https://203.0.113.10:8006/"
+# proxmox_node     = "sept25-continu-en-femi-fastapi-traefik"

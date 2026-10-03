@@ -1,0 +1,32 @@
+# SSH settings for reaching the VMs.
+#
+# Every VM sits behind the Proxmox host, so each connection has to hop through
+# it. Without this file each host opens its own separate connection to the jump
+# host; run several in parallel and sshd starts dropping the extra ones, which
+# shows up as "timed out during banner exchange".
+#
+# ControlMaster fixes that: the first connection to a host opens a socket, and
+# every later connection reuses it. All four VMs then share one connection to
+# the jump host instead of opening four.
+
+Host proxmox 203.0.113.10
+    HostName 203.0.113.10
+    User <proxmox-ssh-user>
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h-%p
+    ControlPersist 10m
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    StrictHostKeyChecking accept-new
+
+Host 10.10.10.*
+    User femi
+    ProxyJump proxmox
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h-%p
+    ControlPersist 10m
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    StrictHostKeyChecking accept-new
+    # A slow first boot can take a while to answer.
+    ConnectTimeout 30

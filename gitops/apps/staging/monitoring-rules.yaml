@@ -1,0 +1,38 @@
+# What Prometheus scrapes and what it alerts on, for staging.
+#
+# Separate from the monitoring stack Application on purpose. These are custom
+# resources whose definitions the stack installs, so they cannot be applied
+# until it has. The sync wave enforces that: lower numbers first, and anything
+# unannotated is wave 0.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-rules
+  namespace: argocd
+  annotations:
+    # After the stack, which is wave 0.
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik.git
+    targetRevision: main
+    # A plain directory of manifests rather than a chart. Argo CD applies
+    # everything it finds here, so the directory holds only what belongs to
+    # this Application.
+    path: gitops/manifests/staging/monitoring
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

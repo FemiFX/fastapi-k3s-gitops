@@ -1,0 +1,79 @@
+# Plain python:3.11-slim rather than tiangolo/uvicorn-gunicorn.
+#
+# That image has been unmaintained for years. It ships a Python toolchain that
+# `pip install --upgrade` cannot displace -- an old setuptools kept reappearing
+# in the scan whatever we installed over it -- and its entrypoint runs the
+# application as root, which is the last outstanding trivy config finding.
+# Starting from the official image removes both problems and the gunicorn
+# wrapper we were not using.
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# prestart.sh uses `nc` to wait for PostgreSQL. The plain `netcat` package is
+# virtual on current Debian releases and has no installation candidate, so the
+# concrete netcat-openbsd package is required.
+#
+# apt-get upgrade picks up security updates published since the base image was
+# built. Without it the image ships whatever was current on the day that tag
+# was pushed, which is how a base image quietly rots.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Nothing at runtime needs pip, setuptools or wheel. They are build tools, and
+# leaving them in the image means shipping their flaws -- including the copies
+# setuptools vendors privately under _vendor/, which no pip upgrade can reach
+# because they are not installed packages.
+#
+# Removing them is both smaller and safer than trying to keep them patched.
+RUN pip uninstall -y setuptools wheel pip 2>/dev/null || true
+
+# Delete stale inventory documents. Trivy warns on every run that a third-party
+# SBOM may make detection inaccurate, and it demonstrably did here: it reported
+# setuptools 70.3.0 and an msgpack that nothing installs, while the filesystem
+# held setuptools 79.0.1. A wrong inventory is worse than none -- it produces
+# findings that cannot be fixed because they describe software that is not
+# there. Printed before deleting, so the build log says what was removed.
+RUN find / -xdev -type f \( -iname '*.spdx.json' -o -iname '*.cdx.json' -o -iname 'bom.json' -o -iname 'sbom*.json' \) -print -delete 2>/dev/null || true
+
+# Record what was actually installed, in the build log. Several rounds were
+# spent inferring what an upgrade step had done by reading a scanner's summary.
+# A build that states what it shipped is one less thing to guess at.
+RUN python -m pip list --format=columns 2>/dev/null || echo "pip removed, as intended"
+
+COPY . .
+
+# Belt and braces on the execute bit. It is set in git, but a Windows checkout
+# does not always preserve file modes, and prestart.sh is now the entrypoint
+# rather than something the base image happened to call -- so without it the
+# container dies with "permission denied" before the application starts.
+RUN chmod +x ./prestart.sh
+
+# Run as an ordinary user. A fixed uid, so the Helm chart can assert the same
+# number rather than trusting the image to have made a sensible choice.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app \
+    && chown -R app:app /app
+USER 10001
+
+# 8000, not 80. Ports below 1024 are privileged on Linux, so a non-root process
+# cannot bind them without CAP_NET_BIND_SERVICE -- which would mean adding back
+# a capability immediately after dropping them all. The Service still listens on
+# 80 and forwards here by name, so nothing outside the Pod changes.
+EXPOSE 8000
+
+# prestart.sh waits for PostgreSQL and then execs whatever it is given, so the
+# wait applies to any command without being duplicated into it.
+ENTRYPOINT ["./prestart.sh"]
+# python -m uvicorn rather than the uvicorn script. Console scripts have
+# historically imported pkg_resources, which setuptools provides -- and
+# setuptools was just removed. Calling the module skips the question.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

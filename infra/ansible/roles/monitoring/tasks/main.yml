@@ -1,0 +1,274 @@
+---
+# Installs kube-prometheus-stack, points it at the application, and adds the
+# alerts that matter for this project.
+#
+# The stack is: Prometheus (scrapes and stores), Alertmanager (decides who is
+# told), Grafana (draws it), node-exporter (host metrics) and
+# kube-state-metrics (the state of Kubernetes objects themselves -- which is
+# where the backup alerts get their data).
+
+- name: Require a Grafana admin password
+  ansible.builtin.assert:
+    that:
+      - grafana_admin_password | default('') | length > 0
+    fail_msg: >-
+      Set grafana_admin_password. It is passed at run time so no credential is
+      committed:
+      ansible-playbook site.yml --tags monitoring --limit prod-server
+      -e grafana_admin_password=...
+
+- name: Require an application namespace to watch
+  ansible.builtin.assert:
+    that:
+      - app_namespace | default('') | length > 0
+    fail_msg: "This host has no app_namespace set in the inventory."
+
+- name: Add the prometheus-community helm repository
+  ansible.builtin.command: >-
+    helm repo add prometheus-community
+    https://prometheus-community.github.io/helm-charts
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: repo_add
+  changed_when: "'has been added' in repo_add.stdout"
+
+- name: Update helm repositories
+  ansible.builtin.command: helm repo update prometheus-community
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Create the monitoring namespace
+  ansible.builtin.shell: >-
+    k3s kubectl create namespace {{ monitoring_namespace }}
+    --dry-run=client -o yaml | k3s kubectl apply -f -
+  register: ns_applied
+  changed_when: "'created' in ns_applied.stdout"
+
+- name: Render the stack's values
+  # 0600: the file holds the Grafana admin password.
+  ansible.builtin.template:
+    src: values.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.monitoring-values.yaml"
+    mode: "0600"
+
+- name: Install kube-prometheus-stack
+  # No --wait. Helm's wait blocks on every PersistentVolumeClaim binding, and
+  # this chart creates several against a storage class that binds only when a
+  # pod mounts them. The explicit waits below say what "installed" means.
+  ansible.builtin.command:
+    argv: "{{ helm_install_args + helm_version_args }}"
+  vars:
+    helm_install_args:
+      - helm
+      - upgrade
+      - --install
+      - "{{ monitoring_release }}"
+      - prometheus-community/kube-prometheus-stack
+      - --namespace
+      - "{{ monitoring_namespace }}"
+      - --values
+      - "{{ ansible_env.HOME }}/.monitoring-values.yaml"
+      - --timeout
+      - 15m
+    # Empty on a first install, so helm takes the newest chart. Pin it after.
+    helm_version_args: >-
+      {{ ['--version', kube_prometheus_stack_version]
+         if kube_prometheus_stack_version else [] }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+- name: Wait for Prometheus, Alertmanager and Grafana
+  # By label, not by name: the chart's generated resource names depend on the
+  # release name and are truncated, which makes them easy to get subtly wrong.
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ monitoring_namespace }} wait --for=condition=Ready pod
+    -l app.kubernetes.io/name={{ item }} --timeout=600s
+  loop:
+    - prometheus
+    - alertmanager
+    - grafana
+  changed_when: false
+
+- name: Render the ServiceMonitor and the alert rules
+  ansible.builtin.template:
+    src: app-monitoring.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.monitoring-app.yaml"
+    mode: "0644"
+  tags: [rules]
+
+- name: Tell Prometheus what to scrape and what to alert on
+  ansible.builtin.command: >-
+    k3s kubectl apply -f {{ ansible_env.HOME }}/.monitoring-app.yaml
+  register: app_monitoring
+  changed_when: >-
+    'created' in app_monitoring.stdout or 'configured' in app_monitoring.stdout
+  tags: [rules]
+
+- name: Ask Prometheus what it is scraping in the application namespace
+  # A ServiceMonitor the operator ignores produces no error anywhere: Prometheus
+  # simply has no target, Grafana draws an empty graph, and every alert stays
+  # quiet because nothing is being measured. So ask Prometheus directly.
+  #
+  # Queried by namespace rather than by job. The job label is set by the
+  # operator from the Service name, which this role does not own -- an earlier
+  # version guessed "<namespace>/fastapi-app" and asked about a series that
+  # never existed. Nothing else scrapes the application namespace, so the
+  # namespace alone identifies the target and does not depend on a name we do
+  # not control.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      SVC=prometheus-operated
+      # The operator always creates <name>-operated for what it manages.
+      # An earlier version looked the Service up by label: the PODS created by
+      # the operator carry app.kubernetes.io/name but the Services do not, so it
+      # matched nothing and the query never ran at all. Fall back to a name
+      # search, and say which service was used.
+      #
+      # Written as "shell:" then "cmd:" rather than the free-form
+      # "shell: | ...". Free-form is split shell-style first, looking for
+      # options such as chdir=, so quoting inside the script changes how the
+      # script itself is read -- it failed here twice, once on an apostrophe in
+      # a comment and once before the command ran at all. The cmd form is
+      # passed through untouched.
+      k3s kubectl -n {{ monitoring_namespace }} get svc "$SVC" >/dev/null 2>&1 || SVC=$(k3s kubectl -n {{ monitoring_namespace }} get svc -o name | sed "s|service/||" | grep -i prometheus | head -1)
+      echo "Using service $SVC" >&2
+      k3s kubectl -n {{ monitoring_namespace }} run promcheck-$$       --image=curlimages/curl:8.10.1 --rm -i --restart=Never --quiet --       -s --max-time 15       "http://${SVC}:9090/api/v1/query?query=up%7Bnamespace%3D%22{{ app_namespace }}%22%7D"
+  register: prom_up
+  changed_when: false
+  # Do not fail here. The assertion below fails instead, and it can quote what
+  # Prometheus actually answered -- which is the difference between "the check
+  # failed" and knowing why.
+  failed_when: false
+  retries: 12
+  delay: 15
+  until: prom_up.stdout is search('"value":\[[^]]*,"1"\]')
+
+- name: Confirm the application target is up
+  ansible.builtin.assert:
+    that:
+      - prom_up.stdout is search('"value":\[[^]]*,"1"\]')
+    fail_msg: |
+      Prometheus is not scraping the application in namespace
+      "{{ app_namespace }}". Its answer was:
+
+      {{ prom_up.stdout | default('(no response)') }}
+
+      An empty result list means no target exists. Usual causes: the
+      ServiceMonitor was not picked up (check
+      serviceMonitorSelectorNilUsesHelmValues), the Service labels do not match
+      the selector, or the Service has no port named "http".
+
+- name: Confirm the alert rules loaded
+  # A PrometheusRule with a bad expression is rejected by the operator and the
+  # rules never load, again without anything failing visibly.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      SVC=prometheus-operated
+      # The operator always creates <name>-operated for what it manages.
+      # An earlier version looked the Service up by label: the PODS created by
+      # the operator carry app.kubernetes.io/name but the Services do not, so it
+      # matched nothing and the query never ran at all. Fall back to a name
+      # search, and say which service was used.
+      #
+      # No apostrophes in here. ansible.builtin.shell parses its free-form string
+      # with shell-style splitting to find options such as chdir=, so a lone
+      # quote anywhere in the block breaks the play at parse time, before the
+      # task runs. Use the cmd: form if a quote is ever genuinely needed.
+      k3s kubectl -n {{ monitoring_namespace }} get svc "$SVC" >/dev/null 2>&1 || SVC=$(k3s kubectl -n {{ monitoring_namespace }} get svc -o name | sed "s|service/||" | grep -i prometheus | head -1)
+      echo "Using service $SVC" >&2
+      k3s kubectl -n {{ monitoring_namespace }} run rulecheck-$$ \
+        --image=curlimages/curl:8.10.1 --rm -i --restart=Never --quiet -- \
+        -s --max-time 15 "http://${SVC}:9090/api/v1/rules"
+  register: prom_rules
+  changed_when: false
+  failed_when: "'BackupStale' not in prom_rules.stdout"
+  tags: [rules]
+
+- name: Warn if nothing is watching the monitoring itself
+  # Not a failure: alerting to chat is still better than not alerting. But an
+  # alerting system with no dead man's switch cannot tell you it has stopped,
+  # and its silence looks exactly like everything being fine.
+  ansible.builtin.debug:
+    msg: >-
+      mattermost_webhook_url is set but healthchecks_ping_url is not. Alerts
+      will be delivered, but nothing will notice if Alertmanager, Prometheus or
+      this node stops. Create a free check at https://healthchecks.io and pass
+      its ping URL with -e healthchecks_ping_url=...
+  when:
+    - mattermost_webhook_url | default('') | length > 0
+    - healthchecks_ping_url | default('') | length == 0
+
+- name: Confirm Alertmanager loaded the receivers
+  # Alertmanager validates its own configuration and keeps running on the old
+  # one if the new config is rejected, so "the Secret was updated" proves
+  # nothing. Ask Alertmanager what it is actually using.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      SVC=alertmanager-operated
+      # The operator always creates <name>-operated for what it manages.
+      # An earlier version looked the Service up by label: the PODS created by
+      # the operator carry app.kubernetes.io/name but the Services do not, so it
+      # matched nothing and the query never ran at all. Fall back to a name
+      # search, and say which service was used.
+      #
+      # No apostrophes in here. ansible.builtin.shell parses its free-form string
+      # with shell-style splitting to find options such as chdir=, so a lone
+      # quote anywhere in the block breaks the play at parse time, before the
+      # task runs. Use the cmd: form if a quote is ever genuinely needed.
+      k3s kubectl -n {{ monitoring_namespace }} get svc "$SVC" >/dev/null 2>&1 || SVC=$(k3s kubectl -n {{ monitoring_namespace }} get svc -o name | sed "s|service/||" | grep -i alertmanager | head -1)
+      echo "Using service $SVC" >&2
+      k3s kubectl -n {{ monitoring_namespace }} run amcheck-$$       --image=curlimages/curl:8.10.1 --rm -i --restart=Never --quiet --       -s --max-time 15 "http://${SVC}:9093/api/v2/status"
+  register: am_status
+  changed_when: false
+  retries: 6
+  delay: 10
+  until: "'\"name\":\"chat\"' in am_status.stdout or 'name: chat' in am_status.stdout"
+  when: mattermost_webhook_url | default('') | length > 0
+
+- name: Send a test alert
+  # A notification path nobody has fired is a guess, exactly like a backup
+  # nobody has restored. Run deliberately with -e alert_send_test=true, then
+  # look at the channel: delivery is the only proof that counts.
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      SVC=alertmanager-operated
+      # The operator always creates <name>-operated for what it manages.
+      # An earlier version looked the Service up by label: the PODS created by
+      # the operator carry app.kubernetes.io/name but the Services do not, so it
+      # matched nothing and the query never ran at all. Fall back to a name
+      # search, and say which service was used.
+      #
+      # No apostrophes in here. ansible.builtin.shell parses its free-form string
+      # with shell-style splitting to find options such as chdir=, so a lone
+      # quote anywhere in the block breaks the play at parse time, before the
+      # task runs. Use the cmd: form if a quote is ever genuinely needed.
+      k3s kubectl -n {{ monitoring_namespace }} get svc "$SVC" >/dev/null 2>&1 || SVC=$(k3s kubectl -n {{ monitoring_namespace }} get svc -o name | sed "s|service/||" | grep -i alertmanager | head -1)
+      echo "Using service $SVC" >&2
+      k3s kubectl -n {{ monitoring_namespace }} run amtest-$$       --image=curlimages/curl:8.10.1 --rm -i --restart=Never --quiet --       -s --max-time 15 -X POST "http://${SVC}:9093/api/v2/alerts"       -H 'Content-Type: application/json'       -d '[{"labels":{"alertname":"AlertmanagerRouteTest","severity":"warning","namespace":"{{ monitoring_namespace }}"},"annotations":{"summary":"Test alert from the monitoring role","description":"If you can read this in the channel, the route works. It resolves itself."}}]'
+  changed_when: true
+  when:
+    - alert_send_test | default(false) | bool
+    - mattermost_webhook_url | default('') | length > 0
+
+- name: Report the installed chart version
+  ansible.builtin.command: >-
+    helm -n {{ monitoring_namespace }} list -o json
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: helm_list
+  changed_when: false
+
+- name: Show how to reach Grafana, and what to pin
+  ansible.builtin.debug:
+    msg:
+      - "Installed: {{ (helm_list.stdout | from_json | first).chart }}"
+      - "Pin that version in roles/monitoring/defaults/main.yml so the install is reproducible."
+      - "Grafana: ssh -J <proxmox-ssh-user>@<proxmox> -L 3000:localhost:3000 femi@{{ ansible_host }}"
+      - "  then on the node: k3s kubectl -n {{ monitoring_namespace }} port-forward svc/{{ monitoring_release }}-grafana 3000:80 --address 0.0.0.0"
+      - "  then browse http://localhost:3000 as admin"

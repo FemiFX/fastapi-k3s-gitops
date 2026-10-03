@@ -1,0 +1,186 @@
+# Values for kube-prometheus-stack. Rendered by the monitoring role.
+#
+# Two things drive almost every choice here: k3s runs its control plane as a
+# single process, and the node has 6 GB shared with the application.
+
+# --------------------------------------------------------------------------
+# k3s has no separate controller-manager, scheduler, etcd or kube-proxy to
+# scrape: they are all inside the one k3s process and expose no endpoints of
+# their own. Left enabled, the chart creates targets that can never come up and
+# alert rules that fire about a cluster that is perfectly healthy. That noise is
+# the fastest way to teach people to ignore alerts.
+# --------------------------------------------------------------------------
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeSchedulerAlerts: false
+    kubeControllerManager: false
+    kubeProxy: false
+
+prometheus:
+  prometheusSpec:
+    retention: {{ prometheus_retention }}
+    scrapeInterval: 30s
+
+    # By default the operator only picks up ServiceMonitors and rules carrying
+    # this release's own labels, so anything created elsewhere is ignored --
+    # silently. Prometheus simply has no target and says nothing about why.
+    # Setting these to false means "watch everything in the cluster".
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        memory: 1500Mi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: {{ prometheus_storage }}
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: {{ alertmanager_storage }}
+
+grafana:
+  adminPassword: {{ grafana_admin_password | quote }}
+  defaultDashboardsTimezone: utc
+
+  # Loki, so metrics and logs sit on one timeline. Loki itself is installed by
+  # Argo CD from gitops/apps/{{ app_namespace }}/loki.yaml -- this only tells
+  # Grafana it exists. A datasource is how Grafana learns about a store; without
+  # it, Loki can be running perfectly and Grafana will still show no logs.
+  #
+  # Nothing secret here: a ClusterIP in the same namespace, and Loki runs with
+  # auth_enabled: false because there is one tenant.
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      access: proxy
+      url: http://loki.{{ monitoring_namespace }}.svc.cluster.local:3100
+      jsonData:
+        maxLines: 1000
+  # ClusterIP only. Grafana is reached with kubectl port-forward through the
+  # jump host, so it is never exposed to the internet. An admin console on a
+  # public address is a liability that buys nothing here.
+  service:
+    type: ClusterIP
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: {{ grafana_storage }}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+
+{% if mattermost_webhook_url %}
+# --------------------------------------------------------------------------
+# Where alerts go. Without this, alerts fire, appear in a web interface nobody
+# has open, and reach no one -- which is the same as not alerting.
+# --------------------------------------------------------------------------
+alertmanager:
+  config:
+    route:
+      # Group related alerts into one message. Without grouping, a single node
+      # failure sends forty notifications and the channel gets muted, which is
+      # worse than sending none.
+      group_by: [alertname, namespace]
+      group_wait: {{ alert_group_wait }}
+      group_interval: {{ alert_group_interval }}
+      repeat_interval: {{ alert_repeat_interval }}
+      receiver: chat
+      routes:
+        # Watchdog fires forever on purpose. It goes to the dead man's switch
+        # and nowhere else -- it is not news, its ABSENCE is news.
+        - matchers: [alertname="Watchdog"]
+          receiver: deadmansswitch
+          group_wait: 0s
+          group_interval: 5m
+          repeat_interval: 5m
+
+    inhibit_rules:
+      # A backup looks stale when the database is down, and the database being
+      # down is the thing worth reading. Suppress the consequence, keep the
+      # cause.
+      - source_matchers: [severity="critical"]
+        target_matchers: [severity="warning"]
+        equal: [namespace]
+
+    receivers:
+      - name: "null"
+
+      - name: chat
+        # Mattermost accepts Slack-format payloads, so this is slack_configs
+        # pointed at a Mattermost incoming webhook.
+        slack_configs:
+          - api_url: {{ mattermost_webhook_url | quote }}
+            {% if mattermost_channel %}channel: {{ mattermost_channel | quote }}
+            {% endif %}send_resolved: true
+            title: '{% raw %}[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}{% endraw %}'
+            text: |-
+              {% raw %}{{ range .Alerts }}*{{ .Annotations.summary }}*
+              {{ .Annotations.description }}
+              namespace: `{{ .Labels.namespace }}` severity: `{{ .Labels.severity }}`
+              {{ end }}{% endraw %}
+
+      - name: deadmansswitch
+{% if healthchecks_ping_url %}
+        webhook_configs:
+          - url: {{ healthchecks_ping_url | quote }}
+            send_resolved: false
+{% else %}
+        webhook_configs: []
+{% endif %}
+{% endif %}

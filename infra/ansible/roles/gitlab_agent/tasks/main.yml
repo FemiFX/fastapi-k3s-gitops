@@ -1,0 +1,195 @@
+---
+# Installs the GitLab Agent for Kubernetes into a cluster, with permissions
+# scoped to a single namespace.
+#
+# The agent opens an outbound websocket to GitLab and keeps it open. CI jobs
+# then reach the cluster back down that tunnel. Nothing needs a kubeconfig, and
+# nothing needs an inbound firewall rule.
+
+- name: Check whether the agent is already installed
+  # The token is only needed to install the agent. Once it exists this role can
+  # be re-run without one, which is what happens whenever the chart starts
+  # managing a new kind of resource and the permissions need widening.
+  ansible.builtin.command: helm -n {{ gitlab_agent_namespace }} status {{ gitlab_agent_release }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  become: true
+  register: agent_installed
+  failed_when: false
+  changed_when: false
+
+- name: Separate "no such release" from "helm could not answer"
+  # failed_when: false above turns every kind of failure into rc != 0, and the
+  # check below reads rc != 0 as "the agent is not installed". Those are not
+  # the same thing at all. helm cannot reach the cluster, the kubeconfig is
+  # wrong, the namespace does not exist -- all of them look identical to a
+  # missing release, and all of them would send you off to register an agent
+  # that is already running.
+  #
+  # So ask helm what it actually said, and quote it either way.
+  ansible.builtin.assert:
+    that:
+      - agent_installed.rc == 0 or
+        ('not found' in (agent_installed.stderr | default('') | lower))
+    fail_msg: >-
+      helm could not report on the {{ gitlab_agent_release }} release in
+      {{ gitlab_agent_namespace }}, and did not say it was missing. This is a
+      problem reaching the cluster, not a missing agent, so installing one
+      would be the wrong move.
+      helm said: "{{ agent_installed.stderr | default('') | trim }}"
+
+- name: Require an application namespace
+  ansible.builtin.assert:
+    that:
+      - app_namespace | default('') | length > 0
+    fail_msg: "This host has no app_namespace set in the inventory."
+
+- name: Stop early if the agent is missing and no token was supplied
+  ansible.builtin.assert:
+    that:
+      - gitlab_agent_token | default('') | length > 0 or agent_installed.rc == 0
+    fail_msg: >-
+      helm reports no {{ gitlab_agent_release }} release in
+      {{ gitlab_agent_namespace }}, and no token was given. If the agent really
+      is absent, register it in GitLab under Operate > Kubernetes clusters and
+      re-run with -e gitlab_agent_token=glagent-xxxxx.
+      If you believe it IS installed, check where:
+      helm list --all-namespaces | grep -i agent
+      helm said: "{{ agent_installed.stderr | default('') | trim }}"
+
+- name: Create the application namespace
+  # Created here rather than by the pipeline, because the agent is deliberately
+  # not allowed to create namespaces.
+  ansible.builtin.command: >-
+    k3s kubectl create namespace {{ app_namespace }}
+    --dry-run=client -o yaml
+  become: true
+  register: ns_manifest
+  changed_when: false
+
+- name: Apply the application namespace
+  ansible.builtin.shell:
+    cmd: printf '%s' '{{ ns_manifest.stdout }}' | k3s kubectl apply -f -
+  become: true
+  changed_when: "'created' in ns_apply.stdout"
+  register: ns_apply
+
+- name: Add the GitLab helm repository
+  ansible.builtin.command: helm repo add gitlab https://charts.gitlab.io
+  become: true
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: repo_add
+  changed_when: "'has been added' in repo_add.stdout"
+
+- name: Update helm repositories
+  ansible.builtin.command: helm repo update gitlab
+  become: true
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Install the GitLab Agent
+  # rbac.create=false replaces the chart's default cluster-admin binding with
+  # the scoped Role applied below.
+  ansible.builtin.command:
+    argv:
+      - helm
+      - upgrade
+      - --install
+      - "{{ gitlab_agent_release }}"
+      - gitlab/gitlab-agent
+      - --namespace={{ gitlab_agent_namespace }}
+      - --create-namespace
+      - --version={{ gitlab_agent_chart_version }}
+      - --set=config.token={{ gitlab_agent_token }}
+      - --set=config.kasAddress={{ gitlab_kas_address }}
+      - --set=rbac.create=false
+      - --set=serviceAccount.create=true
+      - --set=serviceAccount.name={{ gitlab_agent_service_account }}
+      - --wait
+      - --timeout=5m
+  become: true
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  no_log: true
+  changed_when: true
+  # Skipped on a permissions-only run, when no token was supplied.
+  when: gitlab_agent_token | default('') | length > 0
+
+- name: Render the scoped permissions
+  ansible.builtin.template:
+    src: rbac.yaml.j2
+    dest: /tmp/gitlab-agent-rbac.yaml
+    mode: "0600"
+  become: true
+
+- name: Apply the scoped permissions
+  ansible.builtin.command: k3s kubectl apply -f /tmp/gitlab-agent-rbac.yaml
+  become: true
+  register: rbac_apply
+  changed_when: "'created' in rbac_apply.stdout or 'configured' in rbac_apply.stdout"
+
+- name: Restart the agent so it picks up its new permissions
+  # Also gives us clean logs. Without this the denial check below would still
+  # see errors the agent logged before the permissions were fixed.
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ gitlab_agent_namespace }} rollout restart deployment
+    -l app.kubernetes.io/name=gitlab-agent
+  become: true
+  changed_when: true
+
+- name: Confirm the agent is running
+  # A single wait with its own timeout. An Ansible retry loop around a become
+  # task hammers sudo and can time out waiting for the password prompt.
+  # The chart labels pods app.kubernetes.io/name, not app.
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ gitlab_agent_namespace }}
+    wait --for=condition=Available deployment
+    -l app.kubernetes.io/name=gitlab-agent --timeout=180s
+  become: true
+  changed_when: false
+
+- name: Wait for the replaced pods to disappear
+  # After a restart the old pods spend a few seconds terminating, and their
+  # logs still match the label selector. Those logs contain the errors from
+  # before the permissions were fixed, so sampling too early reports failures
+  # that have already been solved.
+  ansible.builtin.pause:
+    seconds: 45
+
+- name: Check the agent is not being denied permissions
+  # Least privilege is easy to get wrong in the tight direction. If the agent
+  # is missing a right it needs for itself, it says so here.
+  ansible.builtin.shell:
+    cmd: >-
+      k3s kubectl -n {{ gitlab_agent_namespace }} logs
+      -l app.kubernetes.io/name=gitlab-agent --since=30s 2>/dev/null
+      | grep -c 'is forbidden' || true
+  become: true
+  register: agent_denials
+  changed_when: false
+  failed_when: agent_denials.stdout | int > 0
+
+- name: Prove the permissions are scoped, not just present
+  # Positive and negative in one step: the agent can do its own job, and cannot
+  # reach a namespace it has no business in.
+  ansible.builtin.shell:
+    cmd: >-
+      set -e;
+      k3s kubectl auth can-i get leases
+      --as=system:serviceaccount:{{ gitlab_agent_namespace }}:{{ gitlab_agent_service_account }}
+      -n {{ gitlab_agent_namespace }};
+      k3s kubectl auth can-i delete deployments
+      --as=system:serviceaccount:{{ gitlab_agent_namespace }}:{{ gitlab_agent_service_account }}
+      -n kube-system
+  become: true
+  register: rbac_proof
+  changed_when: false
+  failed_when: rbac_proof.stdout_lines != ["yes", "no"]
+
+- name: Report
+  ansible.builtin.debug:
+    msg: >-
+      Agent running in {{ gitlab_agent_namespace }}, allowed to deploy only into
+      namespace {{ app_namespace }}.

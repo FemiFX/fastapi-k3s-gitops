@@ -1,0 +1,128 @@
+---
+# Installs a k3s control plane. Used for both staging (a single node that is
+# also its own worker) and production (which additionally has an agent join).
+#
+# k3s ships Traefik as its default ingress controller, so the reverse proxy
+# knowledge from the Docker Compose setup carries straight over.
+
+- name: Check whether k3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Download the k3s installer
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s-install.sh
+    mode: "0755"
+  when: not k3s_binary.stat.exists
+
+- name: Install the k3s server
+  # --write-kubeconfig-mode 644 lets us read the kubeconfig without sudo.
+  # --tls-san adds the private IP to the API server certificate so a kubeconfig
+  #   used from another machine is accepted.
+  # --node-ip pins the node to the private network address.
+  ansible.builtin.command: /tmp/k3s-install.sh
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: >-
+      server
+      --write-kubeconfig-mode 644
+      --tls-san {{ ansible_host }}
+      --node-ip {{ ansible_host }}
+  become: true
+  when: not k3s_binary.stat.exists
+  changed_when: true
+
+- name: Make sure k3s is running and enabled at boot
+  ansible.builtin.systemd:
+    name: k3s
+    state: started
+    enabled: true
+  become: true
+
+- name: Wait for the node to report Ready
+  ansible.builtin.command: k3s kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=180s
+  become: true
+  changed_when: false
+  retries: 3
+  delay: 10
+  register: node_ready
+  until: node_ready.rc == 0
+
+- name: Configure Traefik
+  # k3s watches this directory and applies what it finds, which is how Traefik
+  # got there in the first place.
+  ansible.builtin.template:
+    src: traefik-config.yaml.j2
+    dest: /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+    mode: "0644"
+  become: true
+  register: traefik_config
+
+- name: Wait for the Traefik Deployment to exist
+  # On a cluster k3s has only just installed, Traefik is not there yet: k3s
+  # creates a HelmChart object and a job installs the chart, which takes a
+  # couple of minutes on a cold node that still has to pull the helm image.
+  #
+  # The next task cannot cover that gap. `rollout status` on a Deployment that
+  # does not exist returns NotFound straight away -- it waits for a rollout, not
+  # for an object -- so its --timeout is never reached and its retries burn
+  # through in half a minute. Wait for the object here, where a missing
+  # Deployment is the expected state rather than an error.
+  ansible.builtin.command: k3s kubectl -n kube-system get deployment traefik
+  changed_when: false
+  retries: 30
+  delay: 10
+  register: traefik_exists
+  until: traefik_exists.rc == 0
+
+- name: Wait for Traefik to come back
+  # Changing the chart values makes k3s roll the Traefik Deployment. Ingress is
+  # briefly disrupted during that roll, so fail here if it does not complete
+  # rather than discovering it later through a broken site.
+  ansible.builtin.command: >-
+    k3s kubectl -n kube-system rollout status deployment/traefik --timeout=180s
+  changed_when: false
+  when: traefik_config.changed
+  retries: 3
+  delay: 10
+  register: traefik_rollout
+  until: traefik_rollout.rc == 0
+
+- name: Confirm Traefik has the expected number of ready replicas
+  ansible.builtin.command: >-
+    k3s kubectl -n kube-system get deployment traefik
+    -o jsonpath={.status.readyReplicas}
+  changed_when: false
+  register: traefik_ready
+  retries: 6
+  delay: 10
+  until: traefik_ready.stdout | int == traefik_replicas | int
+
+- name: Read the node token
+  # Agents use this token to join the cluster.
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  become: true
+  register: k3s_token_raw
+
+- name: Publish the node token as a fact
+  ansible.builtin.set_fact:
+    k3s_node_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+
+- name: Read the kubeconfig
+  ansible.builtin.slurp:
+    src: /etc/rancher/k3s/k3s.yaml
+  become: true
+  register: k3s_kubeconfig_raw
+
+- name: Save a kubeconfig on the control machine
+  # The file k3s writes points at 127.0.0.1, which is only correct on the node
+  # itself. Rewrite it to the node's real address before saving.
+  ansible.builtin.copy:
+    content: "{{ k3s_kubeconfig_raw.content | b64decode | replace('127.0.0.1', ansible_host) }}"
+    dest: "{{ playbook_dir }}/kubeconfig-{{ inventory_hostname }}.yaml"
+    mode: "0600"
+  delegate_to: localhost
+  become: false

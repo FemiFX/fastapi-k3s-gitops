@@ -1,0 +1,129 @@
+---
+# Applied to every VM. Keep this small: things every machine needs, nothing
+# role-specific.
+
+- name: Wait for cloud-init to finish
+  # Cloud-init may still be installing packages on a freshly created VM.
+  # Running apt at the same time causes a lock conflict.
+  ansible.builtin.command: cloud-init status --wait
+  changed_when: false
+  failed_when: false
+
+- name: Update the apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+      - gnupg
+      - python3-pip
+      - unattended-upgrades # applies security updates automatically
+      - chrony             # clock sync; TLS and k8s break on clock drift
+    state: present
+  become: true
+
+- name: Install and enable the QEMU guest agent
+  # Guests only. The Proxmox host is the hypervisor, not a virtual machine:
+  # there is no virtio serial device for the agent to talk over, so the service
+  # has an unsatisfiable dependency and fails to start. It was being installed
+  # everywhere because the common role runs on every host in the inventory.
+  ansible.builtin.apt:
+    name: qemu-guest-agent   # lets Proxmox report VM IPs and shut down cleanly
+    state: present
+  become: true
+  when: "'proxmox' not in group_names"
+
+- name: Enable the QEMU guest agent
+  ansible.builtin.systemd:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+  become: true
+  when: "'proxmox' not in group_names"
+
+- name: Find the authorised public keys
+  ansible.builtin.set_fact:
+    ssh_public_key_files: "{{ query('fileglob', ssh_keys_dir + '/*.pub') | sort }}"
+
+- name: Require at least one public key
+  # An empty directory would quietly authorise nobody, and the first anyone
+  # would know is the next login failing.
+  ansible.builtin.assert:
+    that:
+      - ssh_public_key_files | length > 0
+    fail_msg: >-
+      No *.pub files found in {{ ssh_keys_dir }}. Every key authorised on these
+      machines is read from that directory.
+
+- name: Authorise the public keys
+  # Declared rather than copied. cloud-init puts these on a NEW machine at first
+  # boot; this puts them on the ones that already exist, and keeps them there.
+  # Removing a file from the directory removes the key from every machine,
+  # which a one-off ssh-copy-id could never do.
+  #
+  # exclusive is false, so a key placed by hand is left alone rather than being
+  # silently removed.
+  ansible.posix.authorized_key:
+    user: "{{ ansible_user }}"
+    # trim, because a key file written on Windows carries a trailing
+    # carriage return. Git normalises it on commit, but Ansible reads the
+    # working copy, so a local run would authorise a key with a trailing carriage return.
+    key: "{{ lookup('file', item) | trim }}"
+    state: present
+    exclusive: false
+  loop: "{{ ssh_public_key_files }}"
+  loop_control:
+    label: "{{ item | basename }}"
+
+- name: Set the hostname to match the inventory name
+  # Guests only, and this guard is load-bearing.
+  #
+  # Proxmox keeps every per-node file under /etc/pve/nodes/<hostname>/. Renaming
+  # the hypervisor orphans every VM configuration: the files stay under the old
+  # name while the running system looks under the new one, and no VM will start.
+  # The inventory calls it "proxmox-host", so this task renamed a node called
+  # sept25-continu-en-femi-fastapi-traefik and took the whole estate down.
+  #
+  # It had never run there before only because the play used to abort earlier,
+  # on the qemu-guest-agent task. Fixing that bug let the run reach this one.
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+  when: "'proxmox' not in group_names"
+  become: true
+
+- name: Make sure the hostname resolves locally
+  # Without this, sudo and some services stall on a DNS lookup that never
+  # succeeds, because the private network has no DNS server of its own.
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    line: "127.0.1.1 {{ inventory_hostname }}"
+    state: present
+  become: true
+
+  when: "'proxmox' not in group_names"
+- name: Refuse SSH password logins
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    validate: 'sshd -t -f %s'
+  become: true
+  notify: Restart sshd
+
+- name: Set the root SSH login policy
+  # Not hardcoded to "no". See sshd_permit_root_login in defaults: the Proxmox
+  # host has no other account, so denying root there would lock us out of the
+  # hypervisor and of every VM that is reached through it.
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin'
+    line: 'PermitRootLogin {{ sshd_permit_root_login }}'
+    validate: 'sshd -t -f %s'
+  become: true
+  notify: Restart sshd

@@ -1,0 +1,45 @@
+---
+# Joins a worker node to the production control plane. Agents run workloads but
+# hold no cluster state, so this node can be rebuilt without risk.
+
+- name: Check whether k3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Download the k3s installer
+  ansible.builtin.get_url:
+    url: https://get.k3s.io
+    dest: /tmp/k3s-install.sh
+    mode: "0755"
+  when: not k3s_binary.stat.exists
+
+- name: Install the k3s agent and join the cluster
+  # The token and server address come from the control plane, which the
+  # k3s_server role gathered earlier in the same run.
+  ansible.builtin.command: /tmp/k3s-install.sh
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    K3S_URL: "https://{{ hostvars['prod-server'].ansible_host }}:6443"
+    K3S_TOKEN: "{{ hostvars['prod-server'].k3s_node_token }}"
+    INSTALL_K3S_EXEC: "agent --node-ip {{ ansible_host }}"
+  become: true
+  when: not k3s_binary.stat.exists
+  changed_when: true
+
+- name: Make sure the agent is running and enabled at boot
+  ansible.builtin.systemd:
+    name: k3s-agent
+    state: started
+    enabled: true
+  become: true
+
+- name: Confirm the node joined the cluster
+  ansible.builtin.command: k3s kubectl get node {{ inventory_hostname }}
+  become: true
+  delegate_to: prod-server
+  changed_when: false
+  retries: 6
+  delay: 10
+  register: agent_joined
+  until: agent_joined.rc == 0

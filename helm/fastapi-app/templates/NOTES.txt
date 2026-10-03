@@ -1,0 +1,13 @@
+{{ .Chart.Name }} release "{{ .Release.Name }}" deployed to namespace {{ .Release.Namespace }}.
+
+Image:    {{ .Values.image.repository }}:{{ .Values.image.tag }}
+Replicas: {{ .Values.replicaCount }}
+{{- if .Values.ingress.enabled }}
+URL:      http://{{ .Values.ingress.host }}/
+{{- end }}
+
+Check the rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "fastapi-app.fullname" . }}
+
+Roll back to the previous release if something is wrong:
+  helm -n {{ .Release.Namespace }} rollback {{ .Release.Name }}

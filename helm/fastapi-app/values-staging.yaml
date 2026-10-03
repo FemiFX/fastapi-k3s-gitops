@@ -1,0 +1,12 @@
+# Staging: one replica, not exposed to the internet.
+replicaCount: 1
+
+ingress:
+  enabled: true
+  className: traefik
+  # No public DNS record. Reached through an SSH tunnel to the Proxmox host,
+  # with the hostname sent in the Host header.
+  host: staging.k3s.local
+
+postgres:
+  storage: 5Gi

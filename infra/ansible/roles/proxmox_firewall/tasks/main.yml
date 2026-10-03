@@ -1,0 +1,240 @@
+---
+# Firewall and inbound port forwarding for the Proxmox host.
+#
+# Enabling a firewall on a remote machine can lock you out of it. This role is
+# written so that cannot happen by accident:
+#
+#   1. Rules are written first, with the firewall still switched off.
+#   2. The compiled ruleset is printed, so it can be read before it applies.
+#   3. A guard refuses to enable unless SSH and the web interface are allowed.
+#   4. Only then is the firewall switched on, and SSH is immediately re-tested.
+#
+# Run it once to review, then again with -e firewall_enable=true to apply.
+
+- name: Create a staging directory for the firewall config
+  # /etc/pve is pmxcfs, Proxmox's own filesystem. It forces every file to
+  # root:www-data and refuses chown, which is exactly what Ansible's template
+  # and copy modules do after writing. So the files are rendered on a normal
+  # filesystem first and then copied in with plain cp, which does not chown.
+  ansible.builtin.file:
+    path: /root/.pve-firewall
+    state: directory
+    mode: "0700"
+
+- name: Render the datacenter firewall configuration
+  ansible.builtin.template:
+    src: cluster.fw.j2
+    dest: /root/.pve-firewall/cluster.fw
+    mode: "0600"
+  register: cluster_rendered
+
+- name: Render the host firewall rules
+  ansible.builtin.template:
+    src: host.fw.j2
+    dest: /root/.pve-firewall/host.fw
+    mode: "0600"
+  register: host_rendered
+
+- name: Look at the installed configuration
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: installed
+  loop:
+    - /etc/pve/firewall/cluster.fw
+    - "/etc/pve/nodes/{{ ansible_hostname }}/host.fw"
+
+- name: Install the datacenter firewall configuration
+  ansible.builtin.command: cp /root/.pve-firewall/cluster.fw /etc/pve/firewall/cluster.fw
+  when: >-
+    not installed.results[0].stat.exists
+    or installed.results[0].stat.checksum != cluster_rendered.checksum
+  changed_when: true
+
+- name: Install the host firewall rules
+  ansible.builtin.command: >-
+    cp /root/.pve-firewall/host.fw /etc/pve/nodes/{{ ansible_hostname }}/host.fw
+  when: >-
+    not installed.results[1].stat.exists
+    or installed.results[1].stat.checksum != host_rendered.checksum
+  changed_when: true
+
+- name: Refuse to continue unless SSH and the web interface are allowed
+  # The whole point of the guard: a rule list that forgets these locks us out.
+  ansible.builtin.assert:
+    that:
+      - 22 in (firewall_allowed_tcp_ports | map(attribute='port') | list)
+      - 8006 in (firewall_allowed_tcp_ports | map(attribute='port') | list)
+    fail_msg: >-
+      firewall_allowed_tcp_ports must include 22 (SSH) and 8006 (web interface).
+      Enabling the firewall without them would cut off all access to this host.
+
+- name: Compile the ruleset without applying it
+  # pve-firewall compile is a dry run. It renders exactly what would be loaded,
+  # which is the chance to spot a mistake before it takes effect.
+  ansible.builtin.command: pve-firewall compile
+  register: compiled
+  changed_when: false
+
+- name: Show the rules that would apply to the host
+  ansible.builtin.debug:
+    msg: "{{ compiled.stdout_lines | select('search', 'ACCEPT|DROP|chain PVEFW-HOST-IN') | list }}"
+
+- name: Fail if the configuration does not parse
+  # pve-firewall reports a bad option on stdout and then carries on with the
+  # rest of the file. Ignoring that is how you end up enabling a ruleset that
+  # quietly dropped half of what you wrote.
+  ansible.builtin.assert:
+    that:
+      - compiled.stdout is not search('parse option')
+    fail_msg: >-
+      pve-firewall could not parse the configuration. Offending lines:
+      {{ compiled.stdout_lines | select('search', 'parse option') | list }}
+
+- name: Confirm the rules file really allows SSH and the web interface
+  # Checked against the file rather than the compiled output, because while the
+  # firewall is disabled the compiler emits an empty ruleset and there would be
+  # nothing to look at.
+  ansible.builtin.slurp:
+    src: "/etc/pve/nodes/{{ ansible_hostname }}/host.fw"
+  register: installed_rules
+
+- name: Fail if SSH or the web interface would be blocked
+  ansible.builtin.assert:
+    that:
+      - installed_rules.content | b64decode is search('dport 22')
+      - installed_rules.content | b64decode is search('dport 8006')
+    fail_msg: >-
+      The installed rules do not allow ports 22 and 8006. Enabling the firewall
+      would cut off all access to this host.
+
+- name: Confirm the live ruleset allows SSH
+  # Only meaningful once the firewall is on, when the compiler emits real
+  # iptables commands.
+  ansible.builtin.assert:
+    that:
+      - compiled.stdout is search('dport 22')
+      - compiled.stdout is search('dport 8006')
+    fail_msg: >-
+      The firewall is enabled but the compiled ruleset has no rules for ports
+      22 and 8006. Not restarting the firewall.
+  when: firewall_enable | bool
+
+- name: Report what will happen
+  ansible.builtin.debug:
+    msg: >-
+      {% if firewall_enable %}
+      Firewall is being ENABLED. Ports allowed:
+      {{ firewall_allowed_tcp_ports | map(attribute='port') | join(', ') }}
+      {% else %}
+      Rules written but firewall is still OFF. Read the rules above, then
+      re-run with -e firewall_enable=true to apply them.
+      {% endif %}
+
+- name: Schedule an automatic rollback before enabling anything
+  # A dead man's switch. If the new rules lock us out, this turns the firewall
+  # off again on its own after ten minutes. It is cancelled a few tasks later,
+  # once we have proved the host is still reachable. Without it, a mistake here
+  # needs the hosting provider's console, which belongs to the training
+  # provider rather than to us.
+  ansible.builtin.command: >-
+    systemd-run --on-active=10min --unit=firewall-rollback
+    /bin/sh -c "sed -i 's/^enable: 1/enable: 0/' /etc/pve/firewall/cluster.fw; pve-firewall restart"
+  when: firewall_enable | bool
+  changed_when: true
+
+- name: Reload the firewall
+  ansible.builtin.command: pve-firewall restart
+  changed_when: true
+
+- name: Check we can still reach this host over SSH
+  # Runs from the control machine, over a new connection, after the rules are
+  # live. If the firewall locked us out this fails here rather than silently.
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 22
+    timeout: 30
+  delegate_to: localhost
+  become: false
+
+- name: Check the web interface is still reachable
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 8006
+    timeout: 30
+  delegate_to: localhost
+  become: false
+
+- name: Cancel the automatic rollback
+  # We are still connected, so the rules are good. Without this the firewall
+  # would switch itself off again in a few minutes.
+  ansible.builtin.command: systemctl stop firewall-rollback.timer
+  when: firewall_enable | bool
+  failed_when: false
+  changed_when: true
+
+# --- inbound port forwarding ---
+# Gated on the same flag as the firewall, so a review run really does change
+# nothing. Both are part of the same decision: make production reachable.----------------------------------------------
+# Ports 80 and 443 arrive on the public address and are sent to the production
+# VM. Without this the cluster is unreachable from outside, however correct the
+# ingress is.
+
+- name: Remove the netfilter-persistent saved rules
+  # They cannot be restored. "netfilter-persistent save" wrote the whole
+  # ruleset including pve-firewall's PVEFW-* chains, whose ipsets do not exist
+  # yet when the restore runs at boot. iptables-restore then rejects the entire
+  # file, so nothing loads -- our forwarding rules included. The boot log shows
+  # it plainly: "Set PVEFW-0-management-v4 doesn't exist ... New rules NOT
+  # loaded".
+  ansible.builtin.file:
+    path: "/etc/iptables/{{ item }}"
+    state: absent
+  loop:
+    - rules.v4
+    - rules.v6
+  when: firewall_enable | bool
+
+- name: Stop netfilter-persistent from running at boot
+  ansible.builtin.systemd:
+    name: netfilter-persistent
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: firewall_enable | bool
+
+- name: Install the port forwarding script
+  # One definition of the rules, used by Ansible now and by systemd at boot.
+  # Previously the module applied them and netfilter-persistent restored them:
+  # two mechanisms, and only the first was ever exercised.
+  ansible.builtin.template:
+    src: pve-portforward.sh.j2
+    dest: /usr/local/sbin/pve-portforward
+    mode: "0755"
+  when: firewall_enable | bool
+
+- name: Install the port forwarding service
+  ansible.builtin.template:
+    src: pve-portforward.service.j2
+    dest: /etc/systemd/system/pve-portforward.service
+    mode: "0644"
+  when: firewall_enable | bool
+
+- name: Apply the port forwarding now and at every boot
+  ansible.builtin.systemd:
+    name: pve-portforward
+    daemon_reload: true
+    enabled: true
+    state: restarted
+  when: firewall_enable | bool
+
+- name: Confirm the forwarding rules are actually present
+  # Ask the kernel, not the script. A rule that failed to apply leaves the site
+  # unreachable from outside while everything inside looks healthy, which is
+  # exactly how this went unnoticed until a reboot.
+  ansible.builtin.command: iptables -t nat -S PREROUTING
+  register: nat_rules
+  changed_when: false
+  failed_when: >-
+    nat_rules.stdout is not search('to-destination ' + firewall_production_ip + ':80')
+    or nat_rules.stdout is not search('to-destination ' + firewall_production_ip + ':443')
+  when: firewall_enable | bool

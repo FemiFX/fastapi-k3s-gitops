@@ -1,0 +1,5 @@
+---
+# One place to change the helm version for every role that needs it. It used to
+# be declared, and installed, separately in three roles -- and forgotten in two
+# others, which only showed up when a rebuilt cluster ran them first.
+helm_version: "v3.16.3"

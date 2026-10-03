@@ -1,0 +1,69 @@
+# The application, on staging.
+#
+# Argo CD renders the same Helm chart the pipeline used to install, with the
+# same values file. Nothing about the chart changed; what changed is who
+# applies it and how often.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fastapi-app
+  namespace: argocd
+  finalizers:
+    # Makes deleting this Application delete what it created, rather than
+    # leaving the workloads orphaned in the cluster.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik.git
+    targetRevision: main
+    path: helm/fastapi-app
+    helm:
+      # The Helm release name, which decides every object's name through the
+      # chart's fullname helper.
+      #
+      # Argo CD defaults it to the APPLICATION name. Without this line the
+      # release was called "fastapi-app", the objects came out as
+      # "fastapi-app-fastapi-app-*", and Argo CD deployed a complete second
+      # copy of the stack alongside the existing one -- including a second
+      # PostgreSQL with its own volume -- rather than adopting what was there.
+      #
+      # It must match the release the pipeline created: "staging".
+      releaseName: staging
+      valueFiles:
+        - values-staging.yaml
+      # The image tag is written here by the pipeline after a successful build
+      # and scan. A deploy is therefore a commit, and a rollback is a revert.
+      #
+      # parameters rather than valuesObject: it behaves like helm --set, and it
+      # has been supported far longer, so this does not depend on the chart
+      # version we end up installing.
+      parameters:
+        - name: image.repository
+          value: registry.gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik
+        # The tag currently running. Written by the pipeline after a
+        # successful build and scan; a deploy is a commit to this line.
+        #
+        # It was "latest" as a placeholder, which was a mistake: the build job
+        # deliberately never publishes a "latest" tag, and the moment Argo CD
+        # owned this file the placeholder became live configuration and the
+        # pull failed. Nothing in a reconciled path is inert.
+        - name: image.tag
+          value: "d6a5dea8"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      # The namespace is created by Ansible today. This makes the Application
+      # self-sufficient if it is ever applied to a fresh cluster.
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

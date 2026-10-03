@@ -1,0 +1,18 @@
+# Pinned where the version is chosen deliberately, bounded where it is
+# constrained by something else.
+#
+# ormar 0.26 requires pydantic 2 and SQLAlchemy 2, and no longer uses the
+# `databases` package: it talks to SQLAlchemy's async engine directly. That is
+# why asyncpg is required rather than optional, and why psycopg2-binary is
+# gone -- nothing synchronous connects to the database any more.
+fastapi==0.141.1
+ormar==0.26.0
+prometheus-fastapi-instrumentator==8.1.0
+
+# BaseSettings moved out of pydantic in version 2.
+pydantic-settings>=2.4,<3
+
+# The async PostgreSQL driver. Range set by ormar's own constraint.
+asyncpg>=0.29,<0.32
+
+uvicorn>=0.30,<1

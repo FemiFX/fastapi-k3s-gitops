@@ -1,0 +1,164 @@
+---
+# Installs Argo CD and hands it the one Application that pulls in everything
+# else.
+#
+# This role is the bootstrap and nothing more. Once it has run, the cluster's
+# contents are described in gitops/ and Argo CD keeps them true. Changing what
+# runs in the cluster is then a commit, not another Ansible run.
+
+- name: Require repository credentials
+  ansible.builtin.assert:
+    that:
+      - argocd_repo_username | default('') | length > 0
+      - argocd_repo_password | default('') | length > 0
+    fail_msg: >-
+      Set argocd_repo_username and argocd_repo_password. Use a GitLab deploy
+      token with read_repository only: Argo CD never writes to the repository,
+      and a credential that cannot write cannot be used to push.
+      ansible-playbook site.yml --tags argocd --limit staging
+      -e argocd_repo_username=... -e argocd_repo_password=...
+
+- name: Require an environment to reconcile
+  ansible.builtin.assert:
+    that:
+      - argocd_environment | default('') | length > 0
+    fail_msg: "This host has no app_namespace set in the inventory."
+
+- name: Add the argo helm repository
+  ansible.builtin.command: helm repo add argo https://argoproj.github.io/argo-helm
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: repo_add
+  changed_when: "'has been added' in repo_add.stdout"
+
+- name: Update helm repositories
+  ansible.builtin.command: helm repo update argo
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: false
+
+- name: Render the Argo CD values
+  ansible.builtin.template:
+    src: values.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.argocd-values.yaml"
+    mode: "0600"
+
+- name: Install Argo CD
+  # No --wait, for the same reason as the monitoring stack: it blocks on every
+  # PersistentVolumeClaim binding, and the local-path class binds only when a
+  # pod mounts the claim. The explicit waits below say what installed means.
+  ansible.builtin.command:
+    argv: "{{ argocd_install_args + argocd_version_args }}"
+  vars:
+    argocd_install_args:
+      - helm
+      - upgrade
+      - --install
+      - "{{ argocd_release }}"
+      - argo/argo-cd
+      - --namespace
+      - "{{ argocd_namespace }}"
+      - --create-namespace
+      - --values
+      - "{{ ansible_env.HOME }}/.argocd-values.yaml"
+      - --timeout
+      - 10m
+    argocd_version_args: >-
+      {{ ['--version', argocd_chart_version]
+         if argocd_chart_version else [] }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  changed_when: true
+
+- name: Wait for Argo CD to be ready
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ argocd_namespace }} wait --for=condition=Available
+    deployment --all --timeout=600s
+  changed_when: false
+
+- name: Give Argo CD the repository credentials
+  # Written to a file first, then applied, so the password never appears in a
+  # command line or in the task output.
+  ansible.builtin.template:
+    src: repository.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.argocd-repository.yaml"
+    mode: "0600"
+  no_log: true
+
+- name: Apply the repository credentials
+  ansible.builtin.command: >-
+    k3s kubectl apply -f {{ ansible_env.HOME }}/.argocd-repository.yaml
+  register: repo_secret
+  changed_when: "'created' in repo_secret.stdout or 'configured' in repo_secret.stdout"
+
+- name: Render the root Application
+  ansible.builtin.template:
+    src: root-application.yaml.j2
+    dest: "{{ ansible_env.HOME }}/.argocd-root-application.yaml"
+    mode: "0644"
+
+- name: Apply the root Application
+  # The only object applied by hand. Everything else is reached through it.
+  ansible.builtin.command: >-
+    k3s kubectl apply -f {{ ansible_env.HOME }}/.argocd-root-application.yaml
+  register: root_app
+  changed_when: "'created' in root_app.stdout or 'configured' in root_app.stdout"
+
+- name: Ask Argo CD what it makes of the root Application
+  # Argo CD itself is the only thing that knows whether the credentials work.
+  #
+  # An earlier version ran "git ls-remote" inside the repo-server pod, which
+  # proved nothing: Argo CD holds repository credentials in a Secret and
+  # applies them through its own repository layer, so a bare git command in
+  # that container has no credentials and fails whatever the truth is.
+  ansible.builtin.shell:
+    cmd: |
+      k3s kubectl -n {{ argocd_namespace }} get application root-{{ argocd_environment }}         -o jsonpath='{.status.sync.status} {.status.health.status} {range .status.conditions[*]}{.type}: {.message}; {end}'
+  register: root_status
+  changed_when: false
+  failed_when: false
+  retries: 18
+  delay: 10
+  until: "'Synced' in root_status.stdout"
+
+- name: Confirm the root Application synced
+  ansible.builtin.assert:
+    that:
+      - "'Synced' in root_status.stdout"
+    fail_msg: |
+      The root Application has not synced. Argo CD reports:
+
+        {{ root_status.stdout | default('(no status reported yet)') }}
+
+      Common causes, in the order worth checking:
+        - gitops/apps/{{ argocd_environment }} does not exist on the
+          {{ argocd_target_revision }} branch. Commit and push it first.
+        - the deploy token lacks read_repository, or has expired.
+        - the repository URL is wrong.
+
+- name: Find the Argo CD server service
+  # Resolved, not guessed. The chart does not simply prefix the release name
+  # onto each component, so "argocd-argocd-server" was wrong and the port
+  # forward command printed below was unusable.
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ argocd_namespace }} get svc
+    -l app.kubernetes.io/name=argocd-server
+    -o jsonpath={.items[0].metadata.name}
+  register: argocd_server_svc
+  changed_when: false
+
+- name: Report the installed chart version and how to reach the UI
+  ansible.builtin.command: helm -n {{ argocd_namespace }} list -o json
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: argocd_helm_list
+  changed_when: false
+
+- name: Show what was installed
+  ansible.builtin.debug:
+    msg:
+      - "Installed: {{ (argocd_helm_list.stdout | from_json | first).chart }}"
+      - "Pin that version in roles/argocd/defaults/main.yml for a reproducible install."
+      - "Admin password: k3s kubectl -n {{ argocd_namespace }} get secret argocd-initial-admin-secret -o jsonpath={.data.password} | base64 -d"
+      - "UI: k3s kubectl -n {{ argocd_namespace }} port-forward svc/{{ argocd_server_svc.stdout }} 8080:80 --address 0.0.0.0"
+      - "  then browse http://localhost:8080 through an SSH tunnel, user admin"

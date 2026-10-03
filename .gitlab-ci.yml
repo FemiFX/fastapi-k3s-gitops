@@ -1,0 +1,767 @@
+# GitLab CI pipeline.
+#
+# GitLab Flow: work reaches main by merge request, and main is promoted to
+# production by merging. The branch decides which environment is deployed.
+#
+#   merge request      -> checks only, nothing published or deployed
+#   push to main       -> deploy to staging
+#   push to production -> deploy to production, after a manual click
+#
+# Lint, test and build run on GitLab's shared runners. Deploys reach the
+# clusters through the GitLab Agent for Kubernetes, so no kubeconfig is stored
+# anywhere and no inbound firewall rule is needed.
+
+stages:
+  - quality
+  - test
+  - build
+  - scan
+  - infra
+  - deploy
+
+variables:
+  # GitLab provides these for its own container registry.
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  PYTHON_VERSION: "3.11"
+
+# ---------------------------------------------------------------- quality ---
+
+lint:
+  stage: quality
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet -r requirements-dev.txt
+  script:
+    - ruff check .
+    - black --check .
+
+# ------------------------------------------------------------------- test ---
+
+pytest:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+  image: python:3.11-slim
+  # The app opens a database connection when it is imported, so the tests need
+  # a real PostgreSQL. GitLab runs one alongside the job.
+  services:
+    - name: postgres:15-alpine
+      alias: db
+  variables:
+    POSTGRES_USER: fastapi_traefik
+    POSTGRES_PASSWORD: fastapi_traefik
+    POSTGRES_DB: fastapi_traefik
+    DATABASE_URL: postgresql://fastapi_traefik:fastapi_traefik@db:5432/fastapi_traefik
+  before_script:
+    - pip install --quiet -r requirements-dev.txt
+  script:
+    - pytest
+
+# ------------------------------------------------------------------ build ---
+
+build:
+  stage: build
+  image: docker:27-cli
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "/certs/client"
+    # Overridden to "false" by the merge-request rule below. Declared here so
+    # the script has a value to read on every other kind of pipeline; without a
+    # default, a branch build would fall through to the else branch and push
+    # nothing.
+    PUSH: "true"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    # Tagged by commit SHA, never "latest": a moving tag makes it impossible to
+    # tell what is actually running in an environment.
+    - docker build -f Dockerfile.prod -t "$IMAGE" .
+    # A merge request proves the image still builds. It does not publish it:
+    # the registry should only ever hold images from commits that are on a
+    # branch, or the tag in a deploy could refer to work that was never merged.
+    - |
+      if [ "$PUSH" = "true" ]; then
+        docker push "$IMAGE"
+      else
+        echo "Merge request build. Image built and discarded, not pushed to the registry."
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Merge requests build the image to prove it still builds, but do not push.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        PUSH: "false"
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "production"
+
+# ------------------------------------------------------------------- scan ---
+
+# Three different questions, often confused with each other:
+#
+#   trivy image  - what known flaws are in the software we ship? Compares the
+#                  packages inside the image against CVE databases.
+#   trivy config - is the way we have configured things unsafe? Reads the Helm
+#                  chart and Terraform, not the image.
+#   trivy fs --scanners secret - have we committed a credential?
+#
+# Only the first depends on a built image, so the other two run early where
+# the feedback is fastest.
+
+.trivy:
+  image:
+    name: aquasec/trivy:0.58.1
+    entrypoint: [""]
+  variables:
+    # Trivy downloads a vulnerability database on every run. Caching it turns
+    # a minute of downloading into seconds.
+    TRIVY_CACHE_DIR: .trivycache
+    TRIVY_NO_PROGRESS: "true"
+  cache:
+    key: trivy-db
+    paths:
+      - .trivycache
+
+scan:config:
+  extends: .trivy
+  stage: quality
+  script:
+    # One directory per invocation: trivy config takes a single target and
+    # fails with "multiple targets cannot be specified" if given two.
+    #
+    # Everything found, so the log is useful even when the job passes.
+    - trivy config --severity HIGH,CRITICAL --exit-code 0 helm/
+    - trivy config --severity HIGH,CRITICAL --exit-code 0 infra/
+    # Only CRITICAL blocks today. The HIGH findings are real -- the container
+    # runs as root with a writable filesystem -- and fixing them means moving
+    # the app off port 80 so it can run unprivileged. That is queued as its own
+    # change rather than bundled in here, because it alters how the app runs.
+    - trivy config --severity CRITICAL --exit-code 1 helm/
+    - trivy config --severity CRITICAL --exit-code 1 infra/
+
+scan:secrets:
+  extends: .trivy
+  stage: quality
+  script:
+    # Blocking from the start: unlike CVEs, there is no such thing as a
+    # committed credential you cannot act on.
+    - trivy fs --scanners secret --exit-code 1 --severity HIGH,CRITICAL .
+
+scan:image:
+  extends: .trivy
+  stage: scan
+  needs: [build]
+  variables:
+    # The registry is private, so trivy needs to authenticate to pull.
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    # First pass prints everything, including flaws with no fix available, so
+    # the log tells the whole truth.
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL "$IMAGE"
+    # Second pass is the gate. --ignore-unfixed is what makes it survivable: a
+    # gate that fails on things nobody can fix gets bypassed within a week, and
+    # then it protects nothing while looking like it does.
+    - >
+      trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
+      --ignorefile .trivyignore.yaml
+      --format template --template "@/contrib/gitlab.tpl"
+      --output gl-container-scanning-report.json
+      "$IMAGE"
+  artifacts:
+    # when: always, so the report still reaches the merge request on a failure,
+    # which is exactly when somebody wants to read it.
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "production"
+
+scan:deployed:
+  extends: .trivy
+  stage: scan
+  # Nothing to build: this scans an image that is already running.
+  needs: []
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    # An image does not change, but the world does. A CVE published today makes
+    # yesterday's image vulnerable with no commit and no deploy, and a pipeline
+    # that only scans on push would never look again. Schedule this on the
+    # production branch and it re-checks what is actually running.
+    - >
+      trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
+      --ignorefile .trivyignore.yaml "$IMAGE"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# ------------------------------------------------------------------ infra ---
+
+# Terraform makes the machines, Ansible configures them. Both run here rather
+# than from a laptop, with one exception that matters: applying is behind a
+# manual button.
+#
+# That asymmetry is deliberate. "helm upgrade" replaces pods; "terraform apply"
+# can delete a disk, and the database lives on one. A plan is always produced
+# and always readable before anyone authorises it.
+#
+# These jobs deliberately do NOT use the self-hosted runner. ci-runner is a VM
+# that Terraform manages, so it cannot be the thing that rebuilds it -- the
+# classic bootstrap problem. They run on shared runners, which reach the
+# Proxmox API on :8006 and SSH through the jump host, both already permitted by
+# the host firewall.
+
+# .gitlab-ci.yml is in the changes list alongside infra/**. Editing the file
+# that defines these jobs should re-run them -- otherwise a fix to the pipeline
+# itself skips every job it changes, which is exactly how a correction to the
+# inventory check appeared to do nothing at all.
+#
+# Anything needing the Proxmox credentials can only run where those
+# credentials are available, and protected variables reach protected branches
+# only. A feature branch gets an empty string instead -- silently, which is how
+# this bit us three times before the guards existed.
+.infra_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes: [infra/**/*, .gitlab-ci.yml]
+
+# Formatting and syntax need no credentials at all, so they can run on any
+# branch and in any merge request. This is the check that gives useful feedback
+# before merging.
+.infra_rules_any_branch:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [infra/**/*, .gitlab-ci.yml]
+    - if: $CI_COMMIT_BRANCH
+      changes: [infra/**/*, .gitlab-ci.yml]
+
+.terraform:
+  image:
+    name: hashicorp/terraform:1.9
+    # The image runs terraform as its entrypoint, so a job script would become
+    # "terraform sh -c ...". Same trap as the helm image.
+    entrypoint: [""]
+  variables:
+    TF_IN_AUTOMATION: "true"
+    TF_STATE_NAME: production
+    # GitLab hosts the state. CI_JOB_TOKEN is issued per job and dies with it,
+    # so the pipeline needs no long-lived credential for state at all.
+    TF_HTTP_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}"
+    TF_HTTP_LOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock"
+    TF_HTTP_UNLOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock"
+    TF_HTTP_LOCK_METHOD: POST
+    TF_HTTP_UNLOCK_METHOD: DELETE
+    TF_HTTP_USERNAME: gitlab-ci-token
+    TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+    # Provider inputs, from protected variables. No terraform.tfvars in CI.
+    TF_VAR_proxmox_endpoint: ${PROXMOX_VE_ENDPOINT}
+    TF_VAR_proxmox_api_token: ${PROXMOX_VE_API_TOKEN}
+    # The provider falls back to SSH for a few disk operations. It uses the
+    # same key Ansible does, which is already authorised as root on the host.
+    TF_VAR_proxmox_ssh_private_key_file: ${ANSIBLE_SSH_PRIVATE_KEY}
+  before_script:
+    - cd infra/terraform
+    - |
+      for v in PROXMOX_VE_ENDPOINT PROXMOX_VE_API_TOKEN; do
+        eval "value=\${$v:-}"
+        if [ -z "$value" ]; then
+          echo "$v is empty. Protected variables only reach protected branches, and this is $CI_COMMIT_REF_NAME. Check the variable exists, is ticked Protected, and that this branch is protected." >&2
+          exit 1
+        fi
+      done
+    # Shape, not just presence. A Proxmox token is four parts and only the last
+    # one is prominent when you create it, so storing the bare UUID is the
+    # usual mistake. Checked with a glob so nothing is printed: the provider's
+    # own error names the format but not which variable is wrong.
+    - |
+      case "$PROXMOX_VE_API_TOKEN" in
+        *@*!*=*) ;;
+        *)
+          echo "PROXMOX_VE_API_TOKEN is not in the form USER@REALM!TOKENID=UUID." >&2
+          echo "It holds ${#PROXMOX_VE_API_TOKEN} characters. A full token looks like terraform@pve!ci=<uuid> and is about 55." >&2
+          echo "Storing only the UUID is the usual mistake; the user, realm and token id are part of the credential." >&2
+          exit 1
+          ;;
+      esac
+    - terraform init -input=false
+
+infra:validate:
+  extends: .infra_rules_any_branch
+  stage: quality
+  image:
+    name: hashicorp/terraform:1.9
+    entrypoint: [""]
+  # Deliberately not extending .terraform. Checking formatting and syntax needs
+  # no Proxmox token and no state, so this job holds no credentials and can run
+  # on any branch -- which is exactly where you want to find a typo.
+  #
+  # -backend=false initialises the providers without contacting GitLab for
+  # state, which is what makes that possible.
+  script:
+    - cd infra/terraform
+    - terraform init -backend=false -input=false
+    - terraform fmt -check -recursive -diff
+    - terraform validate
+
+infra:plan:
+  extends: [.terraform, .infra_rules]
+  stage: infra
+  script:
+    # Saved to a file, so apply runs exactly what was reviewed rather than
+    # re-planning against a world that may have moved since.
+    - terraform plan -input=false -out=plan.tfplan
+    - terraform show -json plan.tfplan > plan.json
+  artifacts:
+    paths:
+      - infra/terraform/plan.tfplan
+    reports:
+      # Renders the resource counts in the merge request.
+      terraform: infra/terraform/plan.json
+    expire_in: 7 days
+
+infra:apply:
+  extends: [.terraform, .infra_rules]
+  stage: infra
+  needs: ["infra:plan"]
+  # The gate. Everything up to here is automatic and reversible; this is not.
+  when: manual
+  environment:
+    name: infrastructure
+  script:
+    - terraform apply -input=false plan.tfplan
+
+.ansible:
+  image: python:3.12-slim
+  variables:
+    ANSIBLE_HOST_KEY_CHECKING: "False"
+    ANSIBLE_FORCE_COLOR: "true"
+    # Named explicitly. Ansible refuses to read an ansible.cfg from a
+    # world-writable directory -- a sensible defence against a shared machine,
+    # and the runner's build directory is exactly that. Without this the config
+    # is ignored, the inventory is never loaded, and every play silently runs
+    # against nothing at all while reporting success.
+    ANSIBLE_CONFIG: ${CI_PROJECT_DIR}/infra/ansible/ansible.cfg
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client git
+    - pip install --quiet "ansible-core>=2.16,<2.20"
+    - cd infra/ansible
+    - ansible-galaxy collection install -r requirements.yml
+    # ssh_config sends every VM through the Proxmox host, and both hops use
+    # this key. Writing it to the default location means both hops find it
+    # without ssh_config needing to know a CI-specific path.
+    - python3 "$CI_PROJECT_DIR/infra/ci/install-ssh-key.py"
+    # Ask ssh-keygen whether the key is usable, rather than finding out from a
+    # connection failure. It derives the public half, so it fails if the file
+    # is malformed -- and says so about the key rather than about the host.
+    - |
+      if ! ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null 2>&1; then
+        echo "The private key in ANSIBLE_SSH_PRIVATE_KEY is not readable by ssh." >&2
+        echo "Re-save the variable as File type, pasting the whole file including the BEGIN and END lines and a trailing newline." >&2
+        exit 1
+      fi
+    # Prove the inventory actually loaded. "ansible all -m ping" against an
+    # empty inventory prints a warning and exits 0, so on its own it is a check
+    # that cannot fail -- which is how the first run looked green while doing
+    # nothing.
+    - |
+      # Ansible prints "  hosts (5):" as its first line, so strip everything
+      # that is not a digit. Deliberately no backslashes: the previous attempt
+      # used a sed backreference and the escape did not survive into the file,
+      # leaving a pattern that always produced nothing. The version before that
+      # grepped for six spaces where the output uses four.
+      #
+      # Both were wrong in the safe direction, which is luck rather than design.
+      hosts=$(ansible all --list-hosts 2>/dev/null | head -1 | tr -dc '0-9')
+      hosts=${hosts:-0}
+      echo "Inventory resolved $hosts hosts."
+      if [ "$hosts" -lt 1 ]; then
+        echo "No hosts in the inventory. ANSIBLE_CONFIG is $ANSIBLE_CONFIG" >&2
+        exit 1
+      fi
+    - ansible all -m ping
+
+infra:destroy:staging:
+  extends: .terraform
+  stage: infra
+  # Manual, and deliberately never automatic under any rule. There is no
+  # condition under which a pipeline should decide to delete a machine.
+  when: manual
+  # A pipeline failure must not be reported as a successful destroy, and a
+  # skipped destroy must not fail the pipeline.
+  allow_failure: true
+  environment:
+    name: infrastructure
+    action: stop
+  variables:
+    # Typed by hand when the job is run, in the "Run job" dialog. Not a
+    # checkbox: the point is that deleting a machine should take a moment of
+    # deliberate typing, and that the words name what is about to happen.
+    CONFIRM_DESTROY: ""
+  script:
+    - |
+      expected="destroy staging"
+      if [ "${CONFIRM_DESTROY:-}" != "$expected" ]; then
+        echo "Refusing to destroy anything." >&2
+        echo "Run this job with the variable CONFIRM_DESTROY set to exactly: $expected" >&2
+        echo "Received: '${CONFIRM_DESTROY:-}'" >&2
+        exit 1
+      fi
+    - |
+      echo "About to destroy the staging VM."
+      echo "Everything on its disk goes with it: the k3s cluster, the staging"
+      echo "database, its PersistentVolumes and any backups held only there."
+      echo "Production is untouched -- this is scoped to one resource."
+    # Targeted on purpose. A bare "terraform destroy" would take all four VMs,
+    # production included, and there is no reason for a pipeline to be able to
+    # do that. Destroying production is a laptop operation with a human
+    # present and a reason.
+    - terraform plan -destroy -input=false -target='proxmox_virtual_environment_vm.vm["staging"]' -out=destroy.tfplan
+    - terraform apply -input=false destroy.tfplan
+    - |
+      echo "Staging is gone. To rebuild it:"
+      echo "  1. run infra:apply, which recreates the VM"
+      echo "  2. run infra:configure, which installs k3s"
+      echo "  3. ansible-playbook site.yml --tags argocd --limit staging -e argocd_repo_username=... -e argocd_repo_password=..."
+      echo "  4. Argo CD pulls the rest from git"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+infra:configure:
+  extends: [.ansible, .infra_rules]
+  stage: infra
+  needs:
+    - job: "infra:plan"
+    - job: "infra:apply"
+      optional: true
+  script:
+    # Only the roles that are safe to run unattended.
+    #
+    # proxmox_firewall is NOT here on purpose. It is idempotent, and it can
+    # still lock us out of the hypervisor -- idempotent does not mean safe
+    # without a human watching. Same for certs, which talk to a rate-limited
+    # certificate authority, and for monitoring, which needs credentials passed
+    # at run time.
+    - ansible-playbook site.yml --tags common,k3s
+
+# ----------------------------------------------------------------- deploy ---
+
+# Deploys go through the GitLab Agent for Kubernetes. The agent runs inside
+# each cluster and holds an outbound connection open to GitLab, so the job
+# reaches the cluster back down that tunnel. There is no kubeconfig to store,
+# and the agent's permissions are limited to one namespace by RBAC applied when
+# it was installed.
+#
+# GitLab injects a kubeconfig containing a context per authorised agent, named
+# <project-path>:<agent-name>.
+
+# Reaching the cluster through the GitLab Agent. Shared by the jobs that still
+# need kubectl: creating Secrets, and confirming a release actually rolled out.
+.kubectl:
+  stage: deploy
+  # Runs on our own runner so GitLab's free CI minutes are not consumed. With
+  # the agent it would work on a shared runner too, since the cluster is
+  # reached through GitLab rather than over the network.
+  tags: [proxmox]
+  image:
+    name: alpine/helm:3.16.3
+    # This image runs helm as its entrypoint. GitLab runs job scripts through a
+    # shell, so without blanking it the job becomes "helm sh -c ..." and fails
+    # with: unknown command "sh" for "helm".
+    entrypoint: [""]
+  before_script:
+    # The image ships helm but not kubectl. Pinned to the cluster's version.
+    - apk add --no-cache curl >/dev/null
+    - curl -sfLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl
+    - chmod +x /usr/local/bin/kubectl
+    # GitLab writes a kubeconfig holding a context per authorised agent. It
+    # lands world-readable, which kubectl complains about.
+    - chmod 600 "$KUBECONFIG"
+    # Printed so a wrong context name is obvious in the log rather than showing
+    # up later as a confusing connection error.
+    - kubectl config get-contexts
+    - kubectl config use-context "$CI_PROJECT_PATH:$AGENT"
+
+  # Every `kubectl apply` below uses --server-side. Client-side apply validates
+  # the manifest first, and to do that it downloads the cluster's OpenAPI
+  # schema -- which the GitLab Agent proxy refuses to serve in the format
+  # kubectl asks for:
+  #
+  #   GitLab Agent Server: Failed to negotiate output media type: only the
+  #   following media types are accepted: application/json, application/yaml,
+  #   application/vnd.kubernetes.protobuf
+  #
+  # Server-side apply sends the object to the API server and lets it merge and
+  # validate, so nothing is downloaded and the validating is done by the thing
+  # that owns the rules. --force-conflicts is needed once per object, to take
+  # ownership of fields a previous client-side apply had claimed.
+  #
+  # It is also what Argo CD does for the manifests it applies, so both paths
+  # into these clusters now behave the same way.
+
+# Staging is reconciled by Argo CD, so the pipeline no longer deploys it.
+#
+# It builds the image, scans it, then writes the new tag into the Argo CD
+# Application and pushes. The deploy is a consequence of git changing, not of a
+# pipeline running -- which is what makes a rollback "git revert" and the audit
+# trail the commit history.
+#
+# CI keeps two cluster responsibilities: creating the Secrets, because anything
+# that encrypts them inside the cluster becomes unreadable when the cluster is
+# rebuilt; and confirming the release actually rolled out, because a commit is
+# a request rather than a result.
+
+release:staging:
+  stage: deploy
+  image: python:3.12-slim
+  variables:
+    # A full clone. The default shallow fetch cannot push, and a detached HEAD
+    # has no branch to commit onto.
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+    - git config user.name "GitLab CI"
+    - git config user.email "gitlab-ci@noreply.${CI_SERVER_HOST}"
+  script:
+    - |
+      if [ -z "${GITOPS_PUSH_TOKEN:-}" ]; then
+        echo "GITOPS_PUSH_TOKEN is empty. It needs write_repository and the Maintainer role, because main is a protected branch and Developers cannot push to one." >&2
+        exit 1
+      fi
+    - git remote set-url origin "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch origin main
+    - git checkout -B main origin/main
+    - python3 infra/ci/set-image-tag.py gitops/apps/staging/fastapi-app.yaml "$CI_COMMIT_SHORT_SHA"
+    - |
+      if git diff --quiet; then
+        echo "staging already requests $CI_COMMIT_SHORT_SHA. Nothing to push."
+        exit 0
+      fi
+      git add gitops/apps/staging/fastapi-app.yaml
+      # [skip ci] or this commit starts another pipeline, which writes the same
+      # tag, which starts another pipeline.
+      git commit -m "Deploy $CI_COMMIT_SHORT_SHA to staging. [skip ci]"
+      # Another pipeline may have pushed since the fetch. Rebase and retry once
+      # rather than failing a deploy over a race.
+      if ! git push origin main; then
+        echo "Push rejected, rebasing onto the current main and retrying."
+        git pull --rebase origin main
+        git push origin main
+      fi
+  environment:
+    name: staging
+    url: http://staging.k3s.local
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+
+sync:staging:
+  extends: .kubectl
+  needs: ["release:staging"]
+  variables:
+    ENVIRONMENT: staging
+    NAMESPACE: staging
+    RELEASE: staging
+    AGENT: staging
+  script:
+    # Secrets are still pushed by CI. Argo CD reconciles everything else from
+    # git, but a secret cannot live in git, and anything that decrypts them
+    # inside the cluster dies with the cluster -- which defeats being able to
+    # rebuild it.
+    - >
+      kubectl create secret generic app-secrets
+      --namespace "$NAMESPACE"
+      --from-literal=POSTGRES_USER="$POSTGRES_USER"
+      --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
+      --from-literal=POSTGRES_DB="$POSTGRES_DB"
+      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+    # Alertmanager's Mattermost webhook, for the same reason and in the
+    # monitoring namespace. The chart values that read it are reconciled from
+    # git by Argo CD; the URL is a credential, so it arrives here instead.
+    #
+    # The agent is scoped to the staging namespace, so this needs its own
+    # narrow grant in the monitoring namespace -- see the gitlab_agent role.
+    # Skipped rather than failed when the variable is unset, so a fork or a
+    # cluster without a channel still deploys.
+    - |
+      if [ -n "${STAGING_MATTERMOST_WEBHOOK_URL:-}" ]; then
+        kubectl create secret generic alertmanager-mattermost --namespace monitoring --from-literal=url="$STAGING_MATTERMOST_WEBHOOK_URL" --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+      else
+        echo "STAGING_MATTERMOST_WEBHOOK_URL is not set. Staging alerts will fire but reach nobody." >&2
+      fi
+    # Grafana's admin password, same split. Left to the chart, Grafana's Secret
+    # is regenerated with a fresh random value on EVERY render -- the template
+    # calls randAlphaNum -- so each Argo CD sync rotated it away from the
+    # password Grafana had initialised with, and login broke on the first
+    # values change. A reconciler needs rendering to be deterministic, and a
+    # random value never is.
+    - |
+      if [ -n "${STAGING_GRAFANA_ADMIN_PASSWORD:-}" ]; then
+        kubectl create secret generic grafana-admin --namespace monitoring --from-literal=admin-user=admin --from-literal=admin-password="$STAGING_GRAFANA_ADMIN_PASSWORD" --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+      else
+        echo "STAGING_GRAFANA_ADMIN_PASSWORD is not set. Grafana keeps its current password." >&2
+      fi
+    # Then wait for Argo CD to actually roll the tag we just requested. Pushing
+    # a commit is a request; this is the result. Without it the pipeline goes
+    # green on an intention.
+    - |
+      want="$CI_COMMIT_SHORT_SHA"
+      echo "Waiting for Argo CD to roll ${want} into ${NAMESPACE}."
+      for i in $(seq 1 60); do
+        running=$(kubectl -n "$NAMESPACE" get deploy "$RELEASE"-fastapi-app -o jsonpath="{.spec.template.spec.containers[0].image}" 2>/dev/null || true)
+        case "$running" in
+          *:"$want")
+            echo "Argo CD applied ${want} after $((i*10))s."
+            exit 0
+            ;;
+        esac
+        sleep 10
+      done
+      echo "Argo CD did not apply ${want} within 10 minutes. Currently running: ${running:-nothing}" >&2
+      echo "Check the Application: kubectl -n argocd get application fastapi-app" >&2
+      exit 1
+    - kubectl -n "$NAMESPACE" rollout status deployment/"$RELEASE"-fastapi-app --timeout=5m
+    - kubectl -n "$NAMESPACE" run smoke-$CI_JOB_ID --image=curlimages/curl:8.10.1
+      --rm -i --restart=Never --quiet --
+      -sf --max-time 10 "http://$RELEASE-fastapi-app.$NAMESPACE.svc.cluster.local/health"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Production, the same shape as staging with one difference: releasing is
+# manual.
+#
+# The gate moved rather than disappeared. It used to be a manual helm upgrade;
+# it is now a manual commit. What a human authorises is still "make production
+# run this version", and Argo CD carries it out.
+
+release:production:
+  stage: deploy
+  image: python:3.12-slim
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+    - git config user.name "GitLab CI"
+    - git config user.email "gitlab-ci@noreply.${CI_SERVER_HOST}"
+  script:
+    - |
+      if [ -z "${GITOPS_PUSH_TOKEN:-}" ]; then
+        echo "GITOPS_PUSH_TOKEN is empty. It needs write_repository and the Maintainer role, because production is a protected branch." >&2
+        exit 1
+      fi
+    - git remote set-url origin "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # The Application for production lives on the production branch, because
+    # that is the branch its Argo CD follows. Promotion is still a merge.
+    - git fetch origin production
+    - git checkout -B production origin/production
+    - python3 infra/ci/set-image-tag.py gitops/apps/production/fastapi-app.yaml "$CI_COMMIT_SHORT_SHA"
+    - |
+      if git diff --quiet; then
+        echo "production already requests $CI_COMMIT_SHORT_SHA. Nothing to push."
+        exit 0
+      fi
+      git add gitops/apps/production/fastapi-app.yaml
+      git commit -m "Deploy $CI_COMMIT_SHORT_SHA to production. [skip ci]"
+      if ! git push origin production; then
+        echo "Push rejected, rebasing onto the current production and retrying."
+        git pull --rebase origin production
+        git push origin production
+      fi
+  environment:
+    name: production
+    url: https://project.femidevops.abrdns.com
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "production"
+      when: manual
+      allow_failure: false
+
+sync:production:
+  extends: .kubectl
+  needs: ["release:production"]
+  variables:
+    ENVIRONMENT: production
+    NAMESPACE: production
+    RELEASE: prod
+    AGENT: production
+  script:
+    # Secrets remain CI's job. Argo CD reconciles everything else from git, and
+    # a secret cannot live in git -- while anything that decrypts secrets inside
+    # the cluster dies with the cluster, which defeats being able to rebuild it.
+    - >
+      kubectl create secret generic app-secrets
+      --namespace "$NAMESPACE"
+      --from-literal=POSTGRES_USER="$POSTGRES_USER"
+      --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
+      --from-literal=POSTGRES_DB="$POSTGRES_DB"
+      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+    - |
+      if [ -n "${RESTIC_REPOSITORY:-}" ]; then
+        for v in RESTIC_REPOSITORY RESTIC_PASSWORD R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+          eval "value=\${$v:-}"
+          if [ -z "$value" ]; then
+            echo "$v is empty. Protected variables only reach protected branches." >&2
+            exit 1
+          fi
+        done
+        case "$RESTIC_REPOSITORY" in
+          s3:*|b2:*|sftp:*|rest:*|gs:*|azure:*|swift:*|rclone:*|local:*) ;;
+          *)
+            echo "RESTIC_REPOSITORY needs a backend prefix, for R2 that is s3:https://<account>.r2.cloudflarestorage.com/<bucket>" >&2
+            exit 1
+            ;;
+        esac
+        kubectl create secret generic backup-offsite --namespace "$NAMESPACE" --from-literal=RESTIC_REPOSITORY="$RESTIC_REPOSITORY" --from-literal=RESTIC_PASSWORD="$RESTIC_PASSWORD" --from-literal=AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" --from-literal=AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+      else
+        echo "No RESTIC_REPOSITORY set; skipping off-site backup credentials."
+      fi
+    # Then wait for Argo CD to actually roll it. A commit is a request; this is
+    # the result.
+    - |
+      want="$CI_COMMIT_SHORT_SHA"
+      echo "Waiting for Argo CD to roll ${want} into ${NAMESPACE}."
+      for i in $(seq 1 60); do
+        running=$(kubectl -n "$NAMESPACE" get deploy "$RELEASE"-fastapi-app -o jsonpath="{.spec.template.spec.containers[0].image}" 2>/dev/null || true)
+        case "$running" in
+          *:"$want")
+            echo "Argo CD applied ${want} after $((i*10))s."
+            exit 0
+            ;;
+        esac
+        sleep 10
+      done
+      echo "Argo CD did not apply ${want} within 10 minutes. Currently running: ${running:-nothing}" >&2
+      echo "Check the Application: kubectl -n argocd get application fastapi-app" >&2
+      exit 1
+    - kubectl -n "$NAMESPACE" rollout status deployment/"$RELEASE"-fastapi-app --timeout=5m
+    - kubectl -n "$NAMESPACE" run smoke-$CI_JOB_ID --image=curlimages/curl:8.10.1
+      --rm -i --restart=Never --quiet --
+      -sf --max-time 10 "http://$RELEASE-fastapi-app.$NAMESPACE.svc.cluster.local/health"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "production"

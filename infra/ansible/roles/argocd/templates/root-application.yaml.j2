@@ -1,0 +1,29 @@
+# The one object that has to be applied by hand.
+#
+# It points at a directory of other Applications, so everything else arrives by
+# itself -- the "app of apps" pattern. Rebuilding a cluster becomes: install
+# Argo CD, apply this, wait.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-{{ argocd_environment }}
+  namespace: {{ argocd_namespace }}
+spec:
+  project: default
+  source:
+    repoURL: {{ argocd_repo_url }}
+    targetRevision: {{ argocd_target_revision }}
+    path: gitops/apps/{{ argocd_environment }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ argocd_namespace }}
+  syncPolicy:
+    automated:
+      # Put the cluster back when it drifts from git. Without this Argo CD only
+      # reports the difference and waits to be told.
+      selfHeal: true
+      # Delete what has been removed from git. Without it, deleting a file
+      # leaves the object orphaned in the cluster forever.
+      prune: true
+    syncOptions:
+      - CreateNamespace=true

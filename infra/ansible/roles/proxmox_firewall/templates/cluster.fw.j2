@@ -1,0 +1,7 @@
+# Managed by Ansible. Manual edits will be overwritten.
+#
+# Datacenter level. This is the master switch: with enable set to 0 nothing is
+# filtered anywhere, whatever the host rules say.
+[OPTIONS]
+
+enable: {{ 1 if firewall_enable else 0 }}

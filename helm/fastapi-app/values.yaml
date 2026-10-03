@@ -1,0 +1,153 @@
+# Defaults for the chart. Each environment overrides only what differs, in
+# values-staging.yaml or values-production.yaml. The pipeline additionally
+# overrides the image on every deploy with --set.
+
+replicaCount: 1
+
+# How a rolling update behaves. maxUnavailable 0 means capacity never drops
+# below the replica count during a deploy: a new Pod must be ready before an
+# old one is removed. maxSurge 1 is what makes that possible.
+updateStrategy:
+  maxUnavailable: 0
+  maxSurge: 1
+
+# Spread the replicas across nodes, so losing one node does not take out every
+# copy. Two replicas on the same node protect against a crashed process and
+# nothing else.
+topologySpread:
+  enabled: true
+  # ScheduleAnyway, not DoNotSchedule. A hard rule reads as stronger and is a
+  # trap here: with two replicas on two nodes, a rolling update's extra Pod
+  # would have nowhere to go and the rollout would hang forever. "Spread if you
+  # can" gives the resilience without the deadlock.
+  whenUnsatisfiable: ScheduleAnyway
+
+# Protects against voluntary disruption -- draining a node for maintenance or
+# an upgrade. Without it, a drain can evict every replica at once. It does not
+# apply when there is only one replica, because a budget that can never be met
+# blocks the drain entirely.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+image:
+  # Set by the pipeline to the GitLab container registry path.
+  repository: registry.gitlab.com/oluwafemi.akinlosotu/fast-api-docker-traefik
+  # Always an explicit commit tag in the pipeline, never "latest": a moving tag
+  # makes it impossible to tell what is actually running.
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Credentials are NOT stored in this chart or in Helm's release history. The
+# pipeline creates this Secret with kubectl before installing the chart, and
+# the templates only refer to it by name.
+existingSecret: app-secrets
+
+service:
+  # What the cluster sees. Unchanged: the Ingress and every other consumer
+  # still talk to port 80.
+  port: 80
+
+# What the container listens on. 8000 rather than 80 because ports below 1024
+# are privileged on Linux and the process no longer runs as root. The Service
+# forwards to this by name, so the two can differ without anything noticing.
+containerPort: 8000
+
+# Run the application as an ordinary user with nothing it does not need. Each
+# of these is a finding trivy config reports if it is missing.
+securityContext:
+  # Matches the uid created in Dockerfile.prod. Asserted here as well, so the
+  # cluster refuses to run an image that quietly went back to root.
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  # The application writes nothing to disk, so give it nothing to write to. A
+  # writable /tmp is mounted separately because Python and uvicorn expect one.
+  readOnlyRootFilesystem: true
+  # A process that cannot gain more privilege than it started with.
+  allowPrivilegeEscalation: false
+  # Drop every Linux capability. Serving HTTP on a high port needs none.
+  dropCapabilities: true
+
+ingress:
+  enabled: true
+  className: traefik
+  host: placeholder.example.com
+  tls:
+    # Off by default. Staging is not reachable from the internet, so Let's
+    # Encrypt could not validate it even if we asked.
+    enabled: false
+    # letsencrypt-staging issues untrusted certificates but has far looser rate
+    # limits, so it is the safe way to prove the flow works first.
+    issuer: letsencrypt-prod
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Probe paths match the endpoints added in the application hardening phase.
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readiness:
+    path: /ready
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  startup:
+    path: /health
+    periodSeconds: 5
+    failureThreshold: 30
+
+postgres:
+  enabled: true
+  image: postgres:15-alpine
+  # k3s ships the local-path provisioner, which turns a claim into a directory
+  # on the node.
+  storageClass: local-path
+  storage: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+nameOverride: ""
+fullnameOverride: ""
+
+backup:
+  # A nightly pg_dump kept on its own volume.
+  enabled: true
+  # 02:15 UTC, when nothing else is running.
+  schedule: "15 2 * * *"
+  retentionDays: 14
+  storage: 5Gi
+  # The claim stays Pending until the CronJob first mounts it, which is normal
+  # for this class and is why the deploy waits on the workloads rather than on
+  # every resource. See .gitlab-ci.yml.
+  storageClass: local-path
+
+  # A copy somewhere that is not this node. Without it, the dumps and the
+  # database they protect share a disk, which covers a dropped table and
+  # nothing worse.
+  #
+  # Off by default. Staging has nothing worth shipping and no reason to hold
+  # credentials for a bucket.
+  offsite:
+    enabled: false
+    image: restic/restic:0.17.3
+    # Built by the pipeline from CI/CD variables. Holds RESTIC_REPOSITORY,
+    # RESTIC_PASSWORD, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. The
+    # repository URL contains the account id, so it lives here rather than in
+    # the values file.
+    existingSecret: backup-offsite
+    # How much of the remote repository to actually read back on each run.
+    # Verifying everything nightly is wasteful; verifying nothing is faith.
+    checkSubset: "5%"
